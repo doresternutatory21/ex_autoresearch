@@ -74,7 +74,7 @@ case "${1:-help}" in
       true = Node.connect(target)
       {result, _binding} = :rpc.call(target, Code, :eval_string, [\"\"\"
         ${EXPR}
-      \"\"\"])
+      \"\"\"], :infinity)
       IO.inspect(result, pretty: true, limit: 200, printable_limit: 4096)
       System.halt(0)
     "
@@ -87,7 +87,7 @@ case "${1:-help}" in
       target = :\"${FQDN}\"
       true = Node.connect(target)
       code = File.read!(\"${FILE}\")
-      {result, _binding} = :rpc.call(target, Code, :eval_string, [code])
+      {result, _binding} = :rpc.call(target, Code, :eval_string, [code], :infinity)
       IO.inspect(result, pretty: true, limit: 200, printable_limit: 4096)
       System.halt(0)
     "
