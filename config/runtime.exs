@@ -5,6 +5,18 @@ import Config
 # system starts, so it is typically used to load production configuration
 # and secrets from environment variables or elsewhere. Do not define
 # any compile-time configuration in here, as it won't be applied.
+
+# --- GPU / EXLA backend ---
+gpu_target = System.get_env("GPU_TARGET", "host")
+
+config :nx, default_backend: {EXLA.Backend, client: String.to_atom(gpu_target)}
+config :nx, default_defn_options: [compiler: EXLA, client: String.to_atom(gpu_target)]
+
+config :exla, :clients,
+  cpu: [platform: :host],
+  cuda: [platform: :cuda, preallocate: true],
+  # preallocate: false for iGPU (shared RAM) to avoid freezing the OS
+  rocm: [platform: :rocm, preallocate: false]
 # The block below contains prod specific runtime configuration.
 
 # ## Using releases

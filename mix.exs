@@ -1,6 +1,31 @@
 defmodule ExAutoresearch.MixProject do
   use Mix.Project
 
+  # Pre-built ROCm XLA archive — skips the hour-long Bazel build.
+  # Set XLA_BUILD=true to build from source instead.
+  # For CUDA, build from source or use the official EXLA precompiled binaries.
+  xla_rocm_archive_url =
+    "https://github.com/chgeuer/xla_rocm/releases/download/v0.9.2-rocm/xla_extension-0.9.1-x86_64-linux-gnu-rocm.tar.gz"
+
+  unless System.get_env("XLA_BUILD") do
+    case System.get_env("XLA_TARGET") do
+      "rocm" ->
+        System.put_env("XLA_ARCHIVE_URL", System.get_env("XLA_ARCHIVE_URL") || xla_rocm_archive_url)
+        System.put_env("XLA_TARGET", "rocm")
+
+      "cuda" ->
+        # Use default EXLA precompiled CUDA binary (no custom archive needed)
+        System.put_env("XLA_TARGET", "cuda")
+
+      _ ->
+        # Default to CPU — works everywhere without GPU setup
+        System.put_env("XLA_TARGET", System.get_env("XLA_TARGET") || "cpu")
+    end
+  end
+
+  System.put_env("CC", System.get_env("CC") || "clang")
+  System.put_env("CXX", System.get_env("CXX") || "clang++")
+
   def project do
     [
       app: :ex_autoresearch,
@@ -78,7 +103,20 @@ defmodule ExAutoresearch.MixProject do
       {:gettext, "~> 1.0"},
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.2.0"},
-      {:bandit, "~> 1.5"}
+      {:bandit, "~> 1.5"},
+
+      # ML / GPU
+      {:nx, "~> 0.10.0"},
+      {:exla, "~> 0.10.0"},
+      {:axon, "~> 0.7"},
+      {:polaris, "~> 0.1"},
+
+      # Data
+      # {:arrow, "~> 0.1", only: [:dev, :test]},
+
+      # Agent / LLM
+      # {:jido, path: Path.expand("../../agentjido/jido")},
+      # {:jido_ghcopilot, path: Path.expand("../../agentjido/jido_ghcopilot")},
     ]
   end
 
