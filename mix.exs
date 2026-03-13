@@ -1,9 +1,9 @@
 defmodule ExAutoresearch.MixProject do
   use Mix.Project
 
-  # Pre-built ROCm XLA archive — skips the hour-long Bazel build.
+  # Pre-built XLA archives from xla_rocm — skips the hour-long Bazel build.
   # Set XLA_BUILD=true to build from source instead.
-  # For CUDA, build from source or use the official EXLA precompiled binaries.
+  # For Blackwell (RTX 5070) / CUDA 13, you need the xla_rocm custom build.
   xla_rocm_archive_url =
     "https://github.com/chgeuer/xla_rocm/releases/download/v0.9.2-rocm/xla_extension-0.9.1-x86_64-linux-gnu-rocm.tar.gz"
 
@@ -14,11 +14,13 @@ defmodule ExAutoresearch.MixProject do
         System.put_env("XLA_TARGET", "rocm")
 
       "cuda" ->
-        # Use default EXLA precompiled CUDA binary (no custom archive needed)
+        # For Blackwell GPUs, set XLA_ARCHIVE_URL to a custom CUDA build from xla_rocm,
+        # or set XLA_BUILD=true to build from source with CUDA support.
+        # Standard EXLA precompiled binaries don't support CUDA 13 / sm_120 yet.
         System.put_env("XLA_TARGET", "cuda")
 
       _ ->
-        # Default to CPU — works everywhere without GPU setup
+        # Default: use GPU if XLA_TARGET is set, otherwise CPU
         System.put_env("XLA_TARGET", System.get_env("XLA_TARGET") || "cpu")
     end
   end

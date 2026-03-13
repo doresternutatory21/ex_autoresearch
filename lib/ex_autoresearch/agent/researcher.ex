@@ -196,11 +196,28 @@ defmodule ExAutoresearch.Agent.Researcher do
     case LLM.prompt(prompt_text, system: Program.system_prompt(), model: get_status(:model, "claude-sonnet-4")) do
       {:ok, response} ->
         Logger.info("LLM responded (#{String.length(response)} chars)")
-        broadcast(:agent_responded, %{response: response})
+
+        # Extract reasoning for the log, not raw JSON
+        reasoning = extract_reasoning(response)
+        broadcast(:agent_responded, %{reasoning: reasoning, response: response})
+
         parse_proposal(response, config)
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp extract_reasoning(response) do
+    json_str =
+      case Regex.run(~r/```(?:json)?\s*\n(.*?)\n```/s, response) do
+        [_, json] -> json
+        _ -> response
+      end
+
+    case Jason.decode(json_str) do
+      {:ok, %{"reasoning" => reasoning}} -> reasoning
+      _ -> String.slice(response, 0, 200)
     end
   end
 

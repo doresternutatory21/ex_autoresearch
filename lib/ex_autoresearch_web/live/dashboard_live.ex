@@ -98,8 +98,8 @@ defmodule ExAutoresearchWeb.DashboardLive do
 
   @impl true
   def handle_info({:agent_responded, payload}, socket) do
-    snippet = String.slice(payload[:response], 0, 120)
-    {:noreply, add_log(socket, "💡 #{snippet}...")}
+    reasoning = payload[:reasoning] || String.slice(payload[:response] || "", 0, 200)
+    {:noreply, add_log(socket, "💡 #{reasoning}")}
   end
 
   @impl true
