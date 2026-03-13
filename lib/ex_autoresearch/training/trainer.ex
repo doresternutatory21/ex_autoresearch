@@ -1,31 +1,28 @@
 defmodule ExAutoresearch.Training.Trainer do
   @moduledoc """
-  Training loop GenServer.
+  Time-budgeted training GenServer.
 
-  Manages the time-budgeted training loop:
-  1. Initialize model and optimizer
+  Manages the full training loop:
+  1. Build model and optimizer from config
   2. Run forward/backward passes with gradient accumulation
   3. Apply LR schedule based on wall-clock progress
   4. Stop after time_budget seconds
-  5. Evaluate BPB on validation set
-  6. Broadcast results via PubSub
+  5. Report results via PubSub
   """
 
   use GenServer
 
   require Logger
 
-  alias ExAutoresearch.Model.Config
+  alias ExAutoresearch.Model.{Config, GPT}
+  alias ExAutoresearch.Training.Scheduler
+  alias ExAutoresearch.Data.Loader
 
   defstruct [
     :config,
-    :model,
-    :params,
-    :optimizer_state,
-    :start_time,
-    :step,
-    :total_loss,
-    status: :idle
+    :experiment_id,
+    status: :idle,
+    result: nil
   ]
 
   # Client API
@@ -34,9 +31,14 @@ defmodule ExAutoresearch.Training.Trainer do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc "Start a training run with the given config."
-  def train(%Config{} = config) do
-    GenServer.call(__MODULE__, {:train, config}, :infinity)
+  @doc """
+  Start a training run with the given config.
+
+  Returns `{:ok, result}` when training completes, where result contains
+  the final loss, step count, and timing information.
+  """
+  def train(%Config{} = config, opts \\ []) do
+    GenServer.call(__MODULE__, {:train, config, opts}, :infinity)
   end
 
   @doc "Get current training status."
@@ -44,7 +46,7 @@ defmodule ExAutoresearch.Training.Trainer do
     GenServer.call(__MODULE__, :status)
   end
 
-  # Server callbacks
+  # Server
 
   @impl true
   def init(_opts) do
@@ -52,19 +54,49 @@ defmodule ExAutoresearch.Training.Trainer do
   end
 
   @impl true
-  def handle_call({:train, config}, _from, _state) do
-    Logger.info("Starting training with config: #{inspect(config, limit: 5)}")
+  def handle_call({:train, config, opts}, _from, _state) do
+    experiment_id = Keyword.get(opts, :experiment_id, generate_id())
+
+    new_state = %__MODULE__{
+      config: config,
+      experiment_id: experiment_id,
+      status: :training
+    }
+
+    broadcast("training:#{experiment_id}", :started, %{
+      config: config,
+      experiment_id: experiment_id
+    })
+
+    result = run_training(config, experiment_id)
+
+    final_state = %{new_state | status: :completed, result: result}
+
+    broadcast("training:#{experiment_id}", :complete, result)
+
+    {:reply, {:ok, result}, final_state}
+  end
+
+  @impl true
+  def handle_call(:status, _from, state) do
+    {:reply, %{status: state.status, experiment_id: state.experiment_id, result: state.result}, state}
+  end
+
+  # Training implementation
+
+  defp run_training(%Config{} = config, experiment_id) do
+    n_embd = Config.n_embd(config)
+    Logger.info("[#{experiment_id}] Training: #{config.n_layer}L × #{n_embd}d, vocab=#{config.vocab_size}")
 
     # Build model
-    model = ExAutoresearch.Model.GPT.build(config)
-
-    # Initialize parameters
-    n_embd = Config.n_embd(config)
-    template = %{"input_ids" => Nx.template({config.device_batch_size, config.sequence_len}, :s64)}
+    model = GPT.build(config)
     {init_fn, _predict_fn} = Axon.build(model)
-    params = init_fn.(template, %{})
 
-    # Setup optimizer (AdamW with per-group LRs)
+    # Initialize params
+    template = %{"input_ids" => Nx.iota({config.device_batch_size, config.sequence_len}, type: :s64)}
+    _params = init_fn.(template, Axon.ModelState.empty())
+
+    # Setup optimizer
     optimizer = Polaris.Optimizers.adamw(
       learning_rate: config.matrix_lr,
       b1: config.adam_beta1,
@@ -72,53 +104,114 @@ defmodule ExAutoresearch.Training.Trainer do
       decay: config.weight_decay
     )
 
-    {optimizer_init, _optimizer_update} = optimizer
-    optimizer_state = optimizer_init.(params)
+    # Setup loss function
+    loss_fn = fn y_pred, y_true ->
+      Axon.Losses.categorical_cross_entropy(y_pred, y_true, from_logits: true, reduction: :mean)
+    end
 
-    new_state = %__MODULE__{
-      config: config,
-      model: model,
-      params: params,
-      optimizer_state: optimizer_state,
-      start_time: System.monotonic_time(:millisecond),
-      step: 0,
-      total_loss: 0.0,
-      status: :training
-    }
+    # Create data stream
+    data = Loader.stream(config)
 
-    # For now, return immediately — actual training loop will be
-    # implemented when the dataloader is ready
-    Logger.info("Model initialized: #{n_embd}-dim, #{config.n_layer} layers")
+    # Use a process dictionary flag to track when JIT compilation finishes.
+    # The first iteration includes EXLA compilation time which can be 10-60s.
+    # We start the real timer after the first iteration completes.
+    time_budget_ms = config.time_budget * 1000
+
+    # Custom handler to stop after time budget (excluding JIT warmup)
+    halt_handler = fn state ->
+      # Start timer after first iteration (JIT warmup done)
+      unless Process.get(:training_start_time) do
+        Process.put(:training_start_time, System.monotonic_time(:millisecond))
+        Process.put(:training_steps, 0)
+        Logger.info("[#{experiment_id}] JIT warmup done, starting #{config.time_budget}s timer")
+      end
+
+      Process.put(:training_steps, (Process.get(:training_steps) || 0) + 1)
+      Process.put(:last_loss, state.metrics["loss"])
+
+      start = Process.get(:training_start_time)
+      elapsed = System.monotonic_time(:millisecond) - start
+
+      if elapsed >= time_budget_ms do
+        {:halt_loop, state}
+      else
+        {:continue, state}
+      end
+    end
+
+    # Custom handler to broadcast progress
+    log_handler = fn state ->
+      step = state.iteration
+      start = Process.get(:training_start_time) || System.monotonic_time(:millisecond)
+      elapsed = System.monotonic_time(:millisecond) - start
+      progress = min(elapsed / time_budget_ms, 1.0)
+
+      if rem(step, 5) == 0 do
+        loss_val = case state.metrics do
+          %{"loss" => loss} -> Nx.to_number(loss)
+          _ -> nil
+        end
+
+        lr_mult = Scheduler.lr_multiplier(progress, config)
+
+        broadcast("training:#{experiment_id}", :step, %{
+          step: step,
+          loss: loss_val,
+          lr_multiplier: lr_mult,
+          progress: Float.round(progress * 100, 1),
+          elapsed_ms: elapsed
+        })
+      end
+
+      {:continue, state}
+    end
+
+    loop =
+      Axon.Loop.trainer(model, loss_fn, optimizer, log: 1)
+      |> Axon.Loop.handle_event(:iteration_completed, log_handler)
+      |> Axon.Loop.handle_event(:iteration_completed, halt_handler)
+
+    Logger.info("[#{experiment_id}] Starting training (JIT warmup first, then #{config.time_budget}s)")
+
+    # Run training — use a large iteration count; halt_handler stops us on time
+    final_state = Axon.Loop.run(loop, data, %{}, epochs: 1, iterations: 100_000)
+
+    training_start = Process.get(:training_start_time) || System.monotonic_time(:millisecond)
+    elapsed_ms = System.monotonic_time(:millisecond) - training_start
+    elapsed_s = elapsed_ms / 1000
+
+    # Extract final metrics
+    final_step = Process.get(:training_steps, 0)
+
+    final_loss = case Process.get(:last_loss) do
+      %Nx.Tensor{} = t -> Nx.to_number(t)
+      _ -> nil
+    end
 
     result = %{
-      status: :initialized,
-      n_params: count_params(params),
+      experiment_id: experiment_id,
+      status: :completed,
+      training_seconds: Float.round(elapsed_s, 1),
+      num_steps: final_step,
+      final_loss: final_loss,
+      n_layer: config.n_layer,
       n_embd: n_embd,
-      n_layer: config.n_layer
+      vocab_size: config.vocab_size,
+      sequence_len: config.sequence_len
     }
 
-    {:reply, {:ok, result}, new_state}
+    Logger.info("[#{experiment_id}] Training complete: #{result.num_steps} steps in #{result.training_seconds}s")
+
+    result
   end
 
-  @impl true
-  def handle_call(:status, _from, state) do
-    status = %{
-      status: state.status,
-      step: state.step,
-      elapsed_ms: elapsed_ms(state)
-    }
-
-    {:reply, status, state}
+  defp broadcast(topic, event, payload) do
+    Phoenix.PubSub.broadcast(ExAutoresearch.PubSub, topic, {event, payload})
+  rescue
+    _ -> :ok
   end
 
-  defp elapsed_ms(%{start_time: nil}), do: 0
-  defp elapsed_ms(%{start_time: t}), do: System.monotonic_time(:millisecond) - t
-
-  defp count_params(params) do
-    params
-    |> Enum.flat_map(fn {_name, layer_params} ->
-      Enum.map(layer_params, fn {_key, tensor} -> Nx.size(tensor) end)
-    end)
-    |> Enum.sum()
+  defp generate_id do
+    :crypto.strong_rand_bytes(4) |> Base.hex_encode32(case: :lower, padding: false)
   end
 end
