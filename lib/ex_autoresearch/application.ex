@@ -22,6 +22,8 @@ defmodule ExAutoresearch.Application do
       # Start to serve requests, typically the last entry
       {DNSCluster, query: Application.get_env(:ex_autoresearch, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: ExAutoresearch.PubSub},
+      ExAutoresearch.Training.Trainer,
+      ExAutoresearch.Agent.Researcher,
       ExAutoresearchWeb.Endpoint
     ]
 
