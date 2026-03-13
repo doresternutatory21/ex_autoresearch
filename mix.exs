@@ -16,12 +16,12 @@ defmodule ExAutoresearch.MixProject do
       "cuda" ->
         # For Blackwell GPUs, set XLA_ARCHIVE_URL to a custom CUDA build from xla_rocm,
         # or set XLA_BUILD=true to build from source with CUDA support.
-        # Standard EXLA precompiled binaries don't support CUDA 13 / sm_120 yet.
         System.put_env("XLA_TARGET", "cuda")
 
       _ ->
-        # Default: use GPU if XLA_TARGET is set, otherwise CPU
-        System.put_env("XLA_TARGET", System.get_env("XLA_TARGET") || "cpu")
+        # Default to ROCm (Framework Laptop iGPU)
+        System.put_env("XLA_ARCHIVE_URL", System.get_env("XLA_ARCHIVE_URL") || xla_rocm_archive_url)
+        System.put_env("XLA_TARGET", "rocm")
     end
   end
 

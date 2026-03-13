@@ -7,13 +7,17 @@ import Config
 # any compile-time configuration in here, as it won't be applied.
 
 # --- GPU / EXLA backend ---
-gpu_target = System.get_env("GPU_TARGET", "host")
+# GPU_TARGET selects which EXLA client to use at runtime:
+#   rocm  — AMD iGPU (default, Framework Laptop)
+#   cuda  — NVIDIA discrete GPU (5070, 4090)
+#   host  — CPU fallback
+gpu_target = System.get_env("GPU_TARGET", "rocm")
 
 config :nx, default_backend: {EXLA.Backend, client: String.to_atom(gpu_target)}
 config :nx, default_defn_options: [compiler: EXLA, client: String.to_atom(gpu_target)]
 
 config :exla, :clients,
-  cpu: [platform: :host],
+  host: [platform: :host],
   cuda: [platform: :cuda, preallocate: true],
   # preallocate: false for iGPU (shared RAM) to avoid freezing the OS
   rocm: [platform: :rocm, preallocate: false]
