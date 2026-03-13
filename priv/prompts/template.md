@@ -74,9 +74,11 @@ defmodule ExAutoresearch.Experiments.V_VERSION_ID do
     scale = Nx.rsqrt(Nx.tensor(head_dim, type: :f32))
     scores = Nx.dot(q, [3], [0, 1], k, [3], [0, 1]) |> Nx.multiply(scale)
 
-    mask = Nx.iota({seq_len, seq_len})
-    causal = Nx.greater(Nx.iota({1, seq_len}), Nx.iota({seq_len, 1}))
-    scores = Nx.select(causal, Nx.Constants.neg_infinity(:f32), scores)
+    # Causal mask: prevent attending to future tokens
+    rows = Nx.iota({seq_len, 1})
+    cols = Nx.iota({1, seq_len})
+    mask = Nx.select(Nx.greater(cols, rows), Nx.Constants.neg_infinity(:f32), 0.0)
+    scores = Nx.add(scores, mask)
 
     weights = Axon.Activations.softmax(scores, axis: -1)
     out = Nx.dot(weights, [3], [0, 1], v, [2], [0, 1])
