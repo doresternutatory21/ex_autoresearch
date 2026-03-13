@@ -112,9 +112,11 @@ defmodule ExAutoresearch.Training.Trainer do
     # Create data stream
     data = Loader.stream(config)
 
-    # Use a process dictionary flag to track when JIT compilation finishes.
-    # The first iteration includes EXLA compilation time which can be 10-60s.
-    # We start the real timer after the first iteration completes.
+    # Clear process dictionary from previous runs
+    Process.delete(:training_start_time)
+    Process.delete(:training_steps)
+    Process.delete(:last_loss)
+
     time_budget_ms = config.time_budget * 1000
 
     # Custom handler to stop after time budget (excluding JIT warmup)
@@ -127,7 +129,15 @@ defmodule ExAutoresearch.Training.Trainer do
       end
 
       Process.put(:training_steps, (Process.get(:training_steps) || 0) + 1)
-      Process.put(:last_loss, state.metrics["loss"])
+
+      # Track the raw loss from metrics (running mean)
+      case state.metrics do
+        %{"loss" => %Nx.Tensor{} = loss} ->
+          val = Nx.to_number(loss)
+          # Skip the initial 0.0 from Axon's running mean
+          if val > 0.0, do: Process.put(:last_loss, val)
+        _ -> :ok
+      end
 
       start = Process.get(:training_start_time)
       elapsed = System.monotonic_time(:millisecond) - start
@@ -184,6 +194,7 @@ defmodule ExAutoresearch.Training.Trainer do
     final_step = Process.get(:training_steps, 0)
 
     final_loss = case Process.get(:last_loss) do
+      val when is_float(val) and val > 0.0 -> val
       %Nx.Tensor{} = t -> Nx.to_number(t)
       _ -> nil
     end

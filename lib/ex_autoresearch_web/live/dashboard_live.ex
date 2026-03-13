@@ -122,7 +122,7 @@ defmodule ExAutoresearchWeb.DashboardLive do
   def render(assigns) do
     ~H"""
     <Layouts.app flash={@flash}>
-      <div class="max-w-6xl mx-auto p-6 space-y-6">
+      <div class="mx-auto p-6 space-y-6 flex flex-col h-[calc(100vh-6rem)]">
         <%!-- Header --%>
         <div class="flex items-center justify-between">
           <div>
@@ -160,11 +160,11 @@ defmodule ExAutoresearchWeb.DashboardLive do
             value={if @current_progress, do: "#{@current_progress}%", else: "—"} />
         </div>
 
-        <div class="grid grid-cols-2 gap-6">
+        <div class="grid grid-cols-2 gap-6 flex-1 min-h-0">
           <%!-- Experiment log --%>
-          <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+          <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4 flex flex-col">
             <h2 class="text-lg font-semibold text-zinc-200 mb-3">📊 Experiments</h2>
-            <div class="overflow-y-auto max-h-96">
+            <div class="overflow-y-auto flex-1">
               <table class="w-full text-sm">
                 <thead>
                   <tr class="text-zinc-500 border-b border-zinc-800">
@@ -199,9 +199,9 @@ defmodule ExAutoresearchWeb.DashboardLive do
           </div>
 
           <%!-- Agent log --%>
-          <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+          <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4 flex flex-col">
             <h2 class="text-lg font-semibold text-zinc-200 mb-3">🤖 Agent Log</h2>
-            <div class="overflow-y-auto max-h-96 space-y-1">
+            <div class="overflow-y-auto flex-1 space-y-1">
               <%= if @agent_log == [] do %>
                 <p class="text-zinc-600 text-center py-8">Waiting for agent activity...</p>
               <% else %>
