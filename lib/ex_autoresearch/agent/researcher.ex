@@ -263,7 +263,7 @@ defmodule ExAutoresearch.Agent.Researcher do
     {true, loss}
   end
   defp decide(loss, baseline) when loss < baseline do
-    Logger.info("✅ Improvement! #{baseline} → #{loss} (Δ#{Float.round(baseline - loss, 6)})")
+    Logger.info("✅ Improvement! #{baseline} → #{loss} (Δ#{safe_round(baseline - loss, 6)})")
     {true, loss}
   end
   defp decide(loss, baseline) do
@@ -288,6 +288,10 @@ defmodule ExAutoresearch.Agent.Researcher do
   rescue
     _ -> :ok
   end
+
+  defp safe_round(val, decimals) when is_float(val), do: Float.round(val, decimals)
+  defp safe_round(val, _d) when is_integer(val), do: val / 1
+  defp safe_round(_, _), do: nil
 
   defp gen_id, do: :crypto.strong_rand_bytes(4) |> Base.hex_encode32(case: :lower, padding: false)
 end

@@ -85,7 +85,7 @@ defmodule ExAutoresearch.Experiments.Runner do
         step = Process.get(:training_steps, 0)
         if rem(step, 50) == 0 do
           loss = Process.get(:last_loss)
-          if loss, do: Logger.debug("[#{version_id}] step=#{step} loss=#{Float.round(loss, 6)}")
+          if loss, do: Logger.debug("[#{version_id}] step=#{step} loss=#{safe_round(loss, 6)}")
         end
 
         Phoenix.PubSub.broadcast(ExAutoresearch.PubSub, "agent:events",
@@ -113,14 +113,14 @@ defmodule ExAutoresearch.Experiments.Runner do
     steps = Process.get(:training_steps, 0)
     loss = Process.get(:last_loss)
 
-    Logger.info("[#{version_id}] Done: #{steps} steps in #{Float.round(elapsed_s, 1)}s, loss=#{loss && Float.round(loss, 6)}")
+    Logger.info("[#{version_id}] Done: #{steps} steps in #{safe_round(elapsed_s, 1)}s, loss=#{loss && safe_round(loss, 6)}")
 
     %{
       version_id: version_id,
       status: :completed,
       loss: loss,
       steps: steps,
-      training_seconds: Float.round(elapsed_s, 1),
+      training_seconds: safe_round(elapsed_s, 1),
       config: config
     }
   rescue
@@ -135,7 +135,11 @@ defmodule ExAutoresearch.Experiments.Runner do
       nil -> 0.0
       start ->
         elapsed = System.monotonic_time(:millisecond) - start
-        Float.round(min(elapsed / time_budget_ms, 1.0) * 100, 1)
+        safe_round(min(elapsed / time_budget_ms, 1.0) * 100, 1)
     end
   end
+
+  defp safe_round(val, decimals) when is_float(val), do: Float.round(val, decimals)
+  defp safe_round(val, _decimals) when is_integer(val), do: val / 1
+  defp safe_round(_, _), do: nil
 end

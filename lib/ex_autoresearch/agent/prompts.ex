@@ -26,7 +26,7 @@ defmodule ExAutoresearch.Agent.Prompts do
     best_section =
       if best do
         """
-        ## Current best version (v_#{best.version_id}, loss: #{best.loss && Float.round(best.loss, 6)})
+        ## Current best version (v_#{best.version_id}, loss: #{safe_round(best.loss, 6)})
 
         ```elixir
         #{best.code}
@@ -38,17 +38,23 @@ defmodule ExAutoresearch.Agent.Prompts do
 
     history_section =
       if history != [] do
+        # Show last 20 experiments to keep prompt size manageable
+        recent = Enum.take(history, -20)
+        total = length(history)
+        kept_count = Enum.count(history, & &1.kept)
+
         rows =
-          history
+          recent
           |> Enum.map(fn e ->
-            loss = e.loss && Float.round(e.loss, 6) || "crash"
+            loss = safe_round(e.loss, 6) || "crash"
             status = if e.kept, do: "✅ kept", else: "❌ discarded"
-            "| v_#{e.version_id} | #{loss} | #{e.steps || 0} | #{e.description || ""} | #{status} |"
+            desc = String.slice(e.description || "", 0, 80)
+            "| v_#{e.version_id} | #{loss} | #{e.steps || 0} | #{desc} | #{status} |"
           end)
           |> Enum.join("\n")
 
         """
-        ## Experiment history
+        ## Experiment history (#{total} total, #{kept_count} kept, showing last 20)
 
         | Version | Loss | Steps | Description | Status |
         |---------|------|-------|-------------|--------|
@@ -67,7 +73,7 @@ defmodule ExAutoresearch.Agent.Prompts do
       |> Enum.take(3)
       |> Enum.map(fn e ->
         """
-        ### v_#{e.version_id} (loss: #{e.loss && Float.round(e.loss, 6)}) — #{e.description}
+        ### v_#{e.version_id} (loss: #{safe_round(e.loss, 6)}) — #{e.description}
 
         ```elixir
         #{e.code}
@@ -95,4 +101,8 @@ defmodule ExAutoresearch.Agent.Prompts do
     #{template_code}
     """
   end
+
+  defp safe_round(val, decimals) when is_float(val), do: Float.round(val, decimals)
+  defp safe_round(val, _decimals) when is_integer(val), do: val / 1
+  defp safe_round(_, _), do: nil
 end
