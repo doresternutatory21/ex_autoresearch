@@ -12,7 +12,11 @@ defmodule ExAutoresearchWeb.DashboardLive do
     end
 
     agent = Researcher.status()
-    experiments = Registry.all() |> Enum.map(&Map.put(&1, :id, &1.version_id))
+    experiments =
+      Registry.all()
+      |> Enum.map(fn exp ->
+        exp |> Map.from_struct() |> Map.put(:id, exp.version_id)
+      end)
 
     socket =
       socket
