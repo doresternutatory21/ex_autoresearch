@@ -37,15 +37,13 @@ defmodule ExAutoresearch.Experiments.Loader do
   def inject_version_id(code, version_id) do
     module_name = "#{@namespace}.V_#{version_id}"
 
-    # Replace the module name in the defmodule declaration
-    code
-    |> String.replace(
-      ~r/defmodule\s+ExAutoresearch\.Experiments\.V_VERSION_ID/,
-      "defmodule #{module_name}"
-    )
-    |> String.replace(
-      ~r/defmodule\s+ExAutoresearch\.Experiments\.V_\w+/,
-      "defmodule #{module_name}"
+    # Replace ANY defmodule declaration with our versioned name.
+    # The LLM may generate arbitrary module names — we always override.
+    String.replace(
+      code,
+      ~r/defmodule\s+[A-Z][\w.]+/,
+      "defmodule #{module_name}",
+      global: false
     )
   end
 
