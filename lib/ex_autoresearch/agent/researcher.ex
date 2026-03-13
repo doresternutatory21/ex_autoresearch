@@ -1,18 +1,18 @@
 defmodule ExAutoresearch.Agent.Researcher do
   @moduledoc """
-  Autonomous experiment loop.
+  Autonomous experiment loop with hot-loaded versioned modules.
 
-  Uses ETS for status so reads never block, even during training.
-  The experiment loop runs in a separate Task.
+  The LLM generates complete Elixir modules that define GPT models.
+  Each version is compiled and loaded into the running BEAM.
+  The best versions survive; worse ones are discarded but preserved.
   """
 
   use GenServer
 
   require Logger
 
-  alias ExAutoresearch.Model.Config
-  alias ExAutoresearch.Training.Trainer
-  alias ExAutoresearch.Agent.{LLM, Program}
+  alias ExAutoresearch.Experiments.{Registry, Loader, Runner}
+  alias ExAutoresearch.Agent.{LLM, Prompts}
 
   @status_table __MODULE__.Status
 
@@ -22,31 +22,18 @@ defmodule ExAutoresearch.Agent.Researcher do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc "Start the autonomous experiment loop."
-  def start_research(opts \\ []) do
-    GenServer.cast(__MODULE__, {:start_research, opts})
-  end
+  def start_research(opts \\ []), do: GenServer.cast(__MODULE__, {:start_research, opts})
+  def stop_research, do: put_status(:status, :stopping)
 
-  @doc "Stop after current experiment finishes."
-  def stop_research do
-    put_status(:status, :stopping)
-  end
-
-  @doc "Get current status (reads ETS, never blocks)."
   def status do
+    best = Registry.best()
     %{
       status: get_status(:status, :idle),
-      experiment_count: get_status(:experiment_count, 0),
-      baseline_loss: get_status(:baseline_loss, nil),
-      current_config: get_status(:current_config, default_config()),
-      current_step: get_status(:current_step, nil),
-      current_progress: get_status(:current_progress, nil)
+      experiment_count: Registry.count(),
+      best_loss: best && best.loss,
+      best_version: best && best.version_id,
+      model: get_status(:model, "claude-sonnet-4")
     }
-  end
-
-  @doc "Get experiment history (reads ETS, never blocks)."
-  def experiments do
-    get_status(:experiments, [])
   end
 
   # Server
@@ -54,26 +41,18 @@ defmodule ExAutoresearch.Agent.Researcher do
   @impl true
   def init(opts) do
     :ets.new(@status_table, [:named_table, :set, :public, read_concurrency: true])
-
-    config = Keyword.get(opts, :config, default_config())
     put_status(:status, :idle)
-    put_status(:current_config, config)
-    put_status(:experiments, [])
-    put_status(:experiment_count, 0)
-    put_status(:baseline_loss, nil)
     put_status(:model, Keyword.get(opts, :model, "claude-sonnet-4"))
-
+    put_status(:time_budget, Keyword.get(opts, :time_budget, 15))
     {:ok, %{task: nil}}
   end
 
   @impl true
   def handle_cast({:start_research, opts}, state) do
-    config = Keyword.get(opts, :config, get_status(:current_config, default_config()))
-    put_status(:current_config, config)
-    put_status(:status, :running)
-
     if opts[:model], do: put_status(:model, opts[:model])
+    if opts[:time_budget], do: put_status(:time_budget, opts[:time_budget])
 
+    put_status(:status, :running)
     broadcast(:status_changed, %{status: :running})
 
     task = Task.async(fn -> experiment_loop() end)
@@ -90,7 +69,7 @@ defmodule ExAutoresearch.Agent.Researcher do
 
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{task: %Task{ref: ref}} = state) do
-    Logger.error("Experiment loop crashed: #{inspect(reason)}")
+    Logger.error("Experiment loop crashed: #{inspect(reason, limit: 3)}")
     put_status(:status, :idle)
     broadcast(:status_changed, %{status: :idle})
     {:noreply, %{state | task: nil}}
@@ -99,20 +78,13 @@ defmodule ExAutoresearch.Agent.Researcher do
   @impl true
   def handle_info(_, state), do: {:noreply, state}
 
-  # Experiment loop (runs in a Task, uses ETS for state)
+  # --- Experiment loop ---
 
   defp experiment_loop do
-    # Ensure Trainer is running
-    case GenServer.whereis(Trainer) do
-      nil -> Trainer.start_link()
-      _pid -> :ok
-    end
-
     # Run baseline if no experiments yet
-    if get_status(:experiment_count, 0) == 0 do
-      Logger.info("Running baseline experiment...")
-      config = get_status(:current_config, default_config())
-      run_experiment(config, "baseline")
+    if Registry.count() == 0 do
+      Logger.info("Loading baseline module...")
+      run_baseline()
     end
 
     loop()
@@ -120,14 +92,11 @@ defmodule ExAutoresearch.Agent.Researcher do
 
   defp loop do
     if get_status(:status) == :running do
-      case propose_next_experiment() do
-        {:ok, config, description} ->
-          run_experiment(config, description)
-          loop()
-
+      case propose_and_run() do
+        :ok -> loop()
         {:error, reason} ->
-          Logger.error("Proposal failed: #{inspect(reason)}")
-          Process.sleep(5_000)
+          Logger.error("Experiment failed: #{inspect(reason, limit: 3)}")
+          Process.sleep(3_000)
           loop()
       end
     else
@@ -135,124 +104,162 @@ defmodule ExAutoresearch.Agent.Researcher do
     end
   end
 
-  defp run_experiment(config, description) do
-    experiment_id = generate_id()
-    Logger.info("[#{experiment_id}] Running: #{description}")
+  defp run_baseline do
+    version_id = gen_id()
+    template = Prompts.read("template.md")
 
-    broadcast(:experiment_started, %{
-      experiment_id: experiment_id,
-      description: description
-    })
+    # Extract the code block from the template
+    code = case Regex.run(~r/```elixir\n(.*?)```/s, template) do
+      [_, elixir_code] -> elixir_code
+      _ -> template
+    end
 
-    put_status(:current_step, 0)
-    put_status(:current_progress, 0)
+    code = Loader.inject_version_id(code, version_id)
 
-    result =
-      case Trainer.train(config, experiment_id: experiment_id) do
-        {:ok, train_result} ->
-          Map.merge(train_result, %{description: description})
+    case Loader.load(version_id, code) do
+      {:ok, module} ->
+        Registry.register(version_id, %{
+          module: module,
+          code: code,
+          description: "baseline",
+          parent_id: nil,
+          status: :running,
+          kept: false,
+          loaded_at: DateTime.utc_now()
+        })
 
-        {:error, reason} ->
-          %{
-            experiment_id: experiment_id,
-            status: :crashed,
-            description: description,
-            error: inspect(reason),
-            final_loss: nil,
-            num_steps: 0,
-            training_seconds: 0
-          }
-      end
+        broadcast(:experiment_started, %{version_id: version_id, description: "baseline"})
 
-    # Decide keep/discard
-    baseline = get_status(:baseline_loss)
-    {kept, new_baseline} = decide(result[:final_loss], baseline)
-    full_result = Map.merge(result, %{kept: kept, id: get_status(:experiment_count, 0)})
+        result = Runner.run(module, version_id: version_id, time_budget: get_status(:time_budget, 15))
 
-    # Update ETS state
-    exps = get_status(:experiments, [])
-    put_status(:experiments, exps ++ [full_result])
-    put_status(:experiment_count, length(exps) + 1)
-    put_status(:baseline_loss, new_baseline)
-    put_status(:current_step, nil)
-    put_status(:current_progress, nil)
+        Registry.update(version_id, %{
+          loss: result[:loss],
+          steps: result[:steps],
+          training_seconds: result[:training_seconds],
+          status: result[:status],
+          kept: true
+        })
 
-    if kept, do: put_status(:current_config, config)
+        broadcast(:experiment_completed, Map.merge(result, %{description: "baseline", kept: true}))
 
-    broadcast(:experiment_completed, full_result)
+        Logger.info("Baseline established: loss=#{result[:loss]}")
 
-    full_result
+      {:error, reason} ->
+        Logger.error("Baseline failed to load: #{inspect(reason)}")
+    end
   end
 
-  defp propose_next_experiment do
-    config = get_status(:current_config, default_config())
-    experiments = get_status(:experiments, [])
+  defp propose_and_run do
+    version_id = gen_id()
+    best = Registry.best()
+    history = Registry.all()
 
-    prompt_text = Program.format_proposal_request(experiments, config)
+    # Build prompt with full context
+    prompt = Prompts.build_proposal_prompt(history, best, version_id)
 
-    Logger.info("Asking LLM for next experiment...")
-    broadcast(:agent_thinking, %{prompt: String.slice(prompt_text, 0, 200) <> "..."})
+    Logger.info("Asking LLM for experiment v_#{version_id}...")
+    broadcast(:agent_thinking, %{version_id: version_id})
 
-    case LLM.prompt(prompt_text, system: Program.system_prompt(), model: get_status(:model, "claude-sonnet-4")) do
+    case LLM.prompt(prompt, system: Prompts.system_prompt(), model: get_status(:model)) do
       {:ok, response} ->
-        Logger.info("LLM responded (#{String.length(response)} chars)")
+        # Extract code and reasoning from response
+        {code, description, reasoning} = parse_response(response, version_id)
 
-        # Extract reasoning for the log, not raw JSON
-        reasoning = extract_reasoning(response)
-        broadcast(:agent_responded, %{reasoning: reasoning, response: response})
+        broadcast(:agent_responded, %{reasoning: reasoning, description: description})
 
-        parse_proposal(response, config)
+        # Load and run
+        code = Loader.inject_version_id(code, version_id)
+
+        case Loader.load(version_id, code) do
+          {:ok, module} ->
+            parent_id = best && best.version_id
+
+            Registry.register(version_id, %{
+              module: module,
+              code: code,
+              description: description,
+              parent_id: parent_id,
+              status: :running,
+              kept: false,
+              loaded_at: DateTime.utc_now()
+            })
+
+            broadcast(:experiment_started, %{version_id: version_id, description: description})
+
+            result = Runner.run(module, version_id: version_id, time_budget: get_status(:time_budget, 15))
+
+            # Decide
+            {kept, _} = decide(result[:loss], best && best.loss)
+
+            Registry.update(version_id, %{
+              loss: result[:loss],
+              steps: result[:steps],
+              training_seconds: result[:training_seconds],
+              status: result[:status],
+              kept: kept
+            })
+
+            broadcast(:experiment_completed, Map.merge(result, %{description: description, kept: kept}))
+
+            :ok
+
+          {:error, reason} ->
+            Logger.error("Module v_#{version_id} failed to load: #{inspect(reason)}")
+
+            Registry.register(version_id, %{
+              module: nil,
+              code: code,
+              description: description,
+              parent_id: best && best.version_id,
+              status: :crashed,
+              kept: false,
+              loaded_at: DateTime.utc_now()
+            })
+
+            broadcast(:experiment_completed, %{
+              version_id: version_id, description: description,
+              kept: false, status: :crashed, loss: nil, steps: 0,
+              error: inspect(reason)
+            })
+
+            :ok
+        end
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  defp extract_reasoning(response) do
-    json_str =
-      case Regex.run(~r/```(?:json)?\s*\n(.*?)\n```/s, response) do
-        [_, json] -> json
-        _ -> response
-      end
-
-    case Jason.decode(json_str) do
-      {:ok, %{"reasoning" => reasoning}} -> reasoning
-      _ -> String.slice(response, 0, 200)
+  defp parse_response(response, version_id) do
+    # Try to extract code block
+    code = case Regex.run(~r/```elixir\n(.*?)```/s, response) do
+      [_, elixir_code] -> elixir_code
+      _ -> response
     end
-  end
 
-  defp parse_proposal(response, current_config) do
-    json_str =
-      case Regex.run(~r/```(?:json)?\s*\n(.*?)\n```/s, response) do
-        [_, json] -> json
-        _ -> response
-      end
-
-    case Jason.decode(json_str) do
-      {:ok, %{"changes" => changes, "description" => desc}} ->
-        {:ok, apply_changes(current_config, changes), desc}
-
-      {:ok, %{"changes" => changes}} ->
-        {:ok, apply_changes(current_config, changes), "LLM experiment"}
-
-      {:error, _} ->
-        Logger.warning("Could not parse LLM JSON, using baseline config")
-        {:ok, current_config, "retry (parse error)"}
+    # Try to extract reasoning (may be outside code block)
+    reasoning = case Regex.run(~r/(?:reasoning|rationale|why)[:\s]*(.+?)(?:\n\n|```)/si, response) do
+      [_, r] -> String.trim(r)
+      _ ->
+        # Try JSON format
+        case Regex.run(~r/"reasoning"\s*:\s*"([^"]+)"/s, response) do
+          [_, r] -> r
+          _ -> String.slice(response, 0, 200)
+        end
     end
+
+    # Try to extract description from @moduledoc
+    description = case Regex.run(~r/@moduledoc\s+"([^"]+)"/s, code) do
+      [_, d] -> d
+      _ -> "LLM experiment v_#{version_id}"
+    end
+
+    {code, description, reasoning}
   end
 
-  defp apply_changes(config, changes) when is_map(changes) do
-    Enum.reduce(changes, config, fn {key, value}, acc ->
-      atom_key = String.to_existing_atom(key)
-      if Map.has_key?(acc, atom_key), do: Map.put(acc, atom_key, value), else: acc
-    end)
-  rescue
-    _ -> config
-  end
-
-  defp decide(nil, baseline), do: {false, baseline}
+  defp decide(nil, _baseline), do: {false, nil}
   defp decide(loss, nil) do
-    Logger.info("Baseline established: loss=#{loss}")
+    Logger.info("✅ Baseline: loss=#{loss}")
     {true, loss}
   end
   defp decide(loss, baseline) when loss < baseline do
@@ -264,18 +271,9 @@ defmodule ExAutoresearch.Agent.Researcher do
     {false, baseline}
   end
 
-  defp default_config do
-    %Config{
-      n_layer: 2, aspect_ratio: 16, n_head: 2, n_kv_head: 2, head_dim: 16,
-      vocab_size: 256, sequence_len: 32, device_batch_size: 4,
-      time_budget: 15, matrix_lr: 0.01
-    }
-  end
-
-  # ETS helpers
+  # --- Helpers ---
 
   defp put_status(key, value), do: :ets.insert(@status_table, {key, value})
-
   defp get_status(key, default \\ nil) do
     case :ets.lookup(@status_table, key) do
       [{^key, value}] -> value
@@ -291,7 +289,5 @@ defmodule ExAutoresearch.Agent.Researcher do
     _ -> :ok
   end
 
-  defp generate_id do
-    :crypto.strong_rand_bytes(4) |> Base.hex_encode32(case: :lower, padding: false)
-  end
+  defp gen_id, do: :crypto.strong_rand_bytes(4) |> Base.hex_encode32(case: :lower, padding: false)
 end

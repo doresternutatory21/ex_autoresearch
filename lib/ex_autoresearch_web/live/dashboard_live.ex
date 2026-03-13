@@ -2,28 +2,28 @@ defmodule ExAutoresearchWeb.DashboardLive do
   use ExAutoresearchWeb, :live_view
 
   alias ExAutoresearch.Agent.Researcher
+  alias ExAutoresearch.Experiments.Registry
 
   @impl true
   def mount(_params, _session, socket) do
     if connected?(socket) do
       Phoenix.PubSub.subscribe(ExAutoresearch.PubSub, "agent:events")
-      Phoenix.PubSub.subscribe(ExAutoresearch.PubSub, "training:*")
       :timer.send_interval(2000, self(), :tick)
     end
 
-    agent_status = Researcher.status()
-    experiments = Researcher.experiments()
+    agent = Researcher.status()
+    experiments = Registry.all() |> Enum.map(&Map.put(&1, :id, &1.version_id))
 
     socket =
       socket
-      |> assign(:agent_status, agent_status.status)
-      |> assign(:baseline_loss, agent_status.baseline_loss)
-      |> assign(:experiment_count, agent_status.experiment_count)
+      |> assign(:agent_status, agent.status)
+      |> assign(:best_loss, agent.best_loss)
+      |> assign(:best_version, agent.best_version)
+      |> assign(:experiment_count, agent.experiment_count)
       |> assign(:current_step, nil)
-      |> assign(:current_loss, nil)
       |> assign(:current_progress, nil)
       |> assign(:agent_log, [])
-      |> stream(:experiments, experiments |> Enum.with_index() |> Enum.map(fn {e, i} -> Map.put(e, :id, i) end))
+      |> stream(:experiments, experiments)
 
     {:ok, socket}
   end
@@ -42,13 +42,14 @@ defmodule ExAutoresearchWeb.DashboardLive do
 
   @impl true
   def handle_info(:tick, socket) do
-    status = Researcher.status()
+    agent = Researcher.status()
 
     socket =
       socket
-      |> assign(:agent_status, status.status)
-      |> assign(:baseline_loss, status.baseline_loss)
-      |> assign(:experiment_count, status.experiment_count)
+      |> assign(:agent_status, agent.status)
+      |> assign(:best_loss, agent.best_loss)
+      |> assign(:best_version, agent.best_version)
+      |> assign(:experiment_count, agent.experiment_count)
 
     {:noreply, socket}
   end
@@ -58,9 +59,8 @@ defmodule ExAutoresearchWeb.DashboardLive do
     socket =
       socket
       |> assign(:current_step, 0)
-      |> assign(:current_loss, nil)
       |> assign(:current_progress, 0)
-      |> add_log("🧪 Started: #{payload[:description]}")
+      |> add_log("🧪 Started: #{payload[:description]} (v_#{payload[:version_id]})")
 
     {:noreply, socket}
   end
@@ -68,14 +68,25 @@ defmodule ExAutoresearchWeb.DashboardLive do
   @impl true
   def handle_info({:experiment_completed, result}, socket) do
     status = if result[:kept], do: "✅ kept", else: "❌ discarded"
-    loss_str = if result[:final_loss], do: Float.round(result[:final_loss], 6), else: "crash"
+    loss_str = result[:loss] && Float.round(result[:loss], 6) || "crash"
+
+    entry = %{
+      id: result[:version_id],
+      version_id: result[:version_id],
+      loss: result[:loss],
+      steps: result[:steps],
+      training_seconds: result[:training_seconds],
+      description: result[:description],
+      kept: result[:kept],
+      status: result[:status]
+    }
 
     socket =
       socket
-      |> stream_insert(:experiments, Map.put(result, :id, socket.assigns.experiment_count))
+      |> stream_insert(:experiments, entry)
       |> assign(:current_step, nil)
       |> assign(:current_progress, nil)
-      |> add_log("#{status} loss=#{loss_str} steps=#{result[:num_steps]} — #{result[:description]}")
+      |> add_log("#{status} v_#{result[:version_id]} loss=#{loss_str} — #{result[:description]}")
 
     {:noreply, socket}
   end
@@ -85,7 +96,6 @@ defmodule ExAutoresearchWeb.DashboardLive do
     socket =
       socket
       |> assign(:current_step, payload[:step])
-      |> assign(:current_loss, payload[:loss])
       |> assign(:current_progress, payload[:progress])
 
     {:noreply, socket}
@@ -98,7 +108,7 @@ defmodule ExAutoresearchWeb.DashboardLive do
 
   @impl true
   def handle_info({:agent_responded, payload}, socket) do
-    reasoning = payload[:reasoning] || String.slice(payload[:response] || "", 0, 200)
+    reasoning = payload[:reasoning] || "..."
     {:noreply, add_log(socket, "💡 #{reasoning}")}
   end
 
@@ -111,9 +121,8 @@ defmodule ExAutoresearchWeb.DashboardLive do
   def handle_info(_, socket), do: {:noreply, socket}
 
   defp add_log(socket, message) do
-    timestamp = Calendar.strftime(DateTime.utc_now(), "%H:%M:%S")
-    entry = "#{timestamp} #{message}"
-    logs = [entry | socket.assigns.agent_log] |> Enum.take(50)
+    ts = Calendar.strftime(DateTime.utc_now(), "%H:%M:%S")
+    logs = ["#{ts} #{message}" | socket.assigns.agent_log] |> Enum.take(100)
     assign(socket, :agent_log, logs)
   end
 
@@ -121,18 +130,15 @@ defmodule ExAutoresearchWeb.DashboardLive do
   def render(assigns) do
     ~H"""
     <Layouts.app flash={@flash}>
-      <div class="mx-auto p-6 space-y-6 flex flex-col h-[calc(100vh-6rem)]">
+      <div class="max-w-7xl mx-auto p-6 space-y-6">
         <%!-- Header --%>
         <div class="flex items-center justify-between">
           <div>
             <h1 class="text-2xl font-bold text-zinc-100">🔬 ex_autoresearch</h1>
-            <p class="text-zinc-400 text-sm">Autonomous GPT training experiments</p>
+            <p class="text-zinc-400 text-sm">BEAM-native autonomous GPT research · Hot-loaded versioned modules</p>
           </div>
           <div class="flex items-center gap-3">
-            <span class={[
-              "px-3 py-1 rounded-full text-sm font-medium",
-              status_badge_class(@agent_status)
-            ]}>
+            <span class={["px-3 py-1 rounded-full text-sm font-medium", status_class(@agent_status)]}>
               {@agent_status}
             </span>
             <%= if @agent_status in [:idle, :stopping] do %>
@@ -149,63 +155,71 @@ defmodule ExAutoresearchWeb.DashboardLive do
           </div>
         </div>
 
-        <%!-- Stats bar --%>
-        <div class="grid grid-cols-4 gap-4">
-          <.stat_card label="Experiments" value={@experiment_count} />
-          <.stat_card label="Baseline Loss"
-            value={if @baseline_loss, do: Float.round(@baseline_loss, 6), else: "—"} />
-          <.stat_card label="Current Step" value={@current_step || "—"} />
-          <.stat_card label="Progress"
-            value={if @current_progress, do: "#{@current_progress}%", else: "—"} />
+        <%!-- Stats --%>
+        <div class="grid grid-cols-5 gap-4">
+          <.stat label="Versions" value={@experiment_count} />
+          <.stat label="Best Loss" value={@best_loss && Float.round(@best_loss, 6) || "—"} />
+          <.stat label="Best Version" value={@best_version && "v_#{@best_version}" || "—"} />
+          <.stat label="Current Step" value={@current_step || "—"} />
+          <.stat label="Progress" value={@current_progress && "#{@current_progress}%" || "—"} />
         </div>
 
-        <div class="grid grid-cols-2 gap-6 flex-1 min-h-0">
-          <%!-- Experiment log --%>
-          <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4 flex flex-col">
-            <h2 class="text-lg font-semibold text-zinc-200 mb-3">📊 Experiments</h2>
-            <div class="overflow-y-auto flex-1">
+        <div class="grid grid-cols-5 gap-6">
+          <%!-- Experiment versions (wider) --%>
+          <div class="col-span-3 bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+            <h2 class="text-lg font-semibold text-zinc-200 mb-3">📊 Experiment Versions</h2>
+            <div class="overflow-y-auto max-h-[32rem]">
               <table class="w-full text-sm">
                 <thead>
                   <tr class="text-zinc-500 border-b border-zinc-800">
+                    <th class="text-left py-2 px-2">Version</th>
                     <th class="text-left py-2 px-2">Loss</th>
-                    <th class="text-left py-2 px-2">Steps</th>
-                    <th class="text-left py-2 px-2">Time</th>
+                    <th class="text-right py-2 px-2">Steps</th>
+                    <th class="text-right py-2 px-2">Time</th>
                     <th class="text-left py-2 px-2">Description</th>
-                    <th class="text-left py-2 px-2">Status</th>
+                    <th class="text-center py-2 px-2">Status</th>
                   </tr>
                 </thead>
                 <tbody id="experiments" phx-update="stream">
                   <tr :for={{dom_id, exp} <- @streams.experiments} id={dom_id}
-                    class="border-b border-zinc-800/50 hover:bg-zinc-800/30">
-                    <td class="py-2 px-2 font-mono text-zinc-300">
-                      {format_loss(exp[:final_loss])}
+                    class={["border-b border-zinc-800/50 hover:bg-zinc-800/30",
+                            exp[:kept] && "bg-emerald-950/20"]}>
+                    <td class="py-2 px-2 font-mono text-xs text-zinc-400">
+                      {"v_#{exp[:version_id] || "?"}"}
                     </td>
-                    <td class="py-2 px-2 text-zinc-400">{exp[:num_steps] || "—"}</td>
-                    <td class="py-2 px-2 text-zinc-400">{exp[:training_seconds] && "#{exp[:training_seconds]}s" || "—"}</td>
-                    <td class="py-2 px-2 text-zinc-300">{exp[:description] || ""}</td>
-                    <td class="py-2 px-2">
-                      <span class={if exp[:kept], do: "text-emerald-400", else: "text-red-400"}>
-                        {if exp[:kept], do: "✅", else: "❌"}
-                      </span>
+                    <td class="py-2 px-2 font-mono text-zinc-300">
+                      {fmt_loss(exp[:loss])}
+                    </td>
+                    <td class="py-2 px-2 text-right text-zinc-400">
+                      {exp[:steps] || "—"}
+                    </td>
+                    <td class="py-2 px-2 text-right text-zinc-400">
+                      {exp[:training_seconds] && "#{exp[:training_seconds]}s" || "—"}
+                    </td>
+                    <td class="py-2 px-2 text-zinc-300 max-w-xs truncate">
+                      {exp[:description] || ""}
+                    </td>
+                    <td class="py-2 px-2 text-center">
+                      {if exp[:kept], do: "✅", else: if(exp[:status] == :crashed, do: "💥", else: "❌")}
                     </td>
                   </tr>
                 </tbody>
               </table>
               <div class="hidden only:block text-zinc-600 text-center py-8">
-                No experiments yet. Hit Start Research to begin.
+                No experiments yet. Hit ▶ Start Research.
               </div>
             </div>
           </div>
 
           <%!-- Agent log --%>
-          <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4 flex flex-col">
-            <h2 class="text-lg font-semibold text-zinc-200 mb-3">🤖 Agent Log</h2>
-            <div class="overflow-y-auto flex-1 space-y-1">
+          <div class="col-span-2 bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+            <h2 class="text-lg font-semibold text-zinc-200 mb-3">🤖 Agent Reasoning</h2>
+            <div class="overflow-y-auto max-h-[32rem] space-y-1">
               <%= if @agent_log == [] do %>
                 <p class="text-zinc-600 text-center py-8">Waiting for agent activity...</p>
               <% else %>
                 <div :for={entry <- @agent_log}
-                  class="text-sm font-mono text-zinc-400 py-0.5">
+                  class="text-sm font-mono text-zinc-400 py-0.5 leading-relaxed">
                   {entry}
                 </div>
               <% end %>
@@ -217,18 +231,17 @@ defmodule ExAutoresearchWeb.DashboardLive do
     """
   end
 
-  defp status_badge_class(:running), do: "bg-emerald-900 text-emerald-300"
-  defp status_badge_class(:stopping), do: "bg-amber-900 text-amber-300"
-  defp status_badge_class(_), do: "bg-zinc-800 text-zinc-400"
+  defp status_class(:running), do: "bg-emerald-900 text-emerald-300"
+  defp status_class(:stopping), do: "bg-amber-900 text-amber-300"
+  defp status_class(_), do: "bg-zinc-800 text-zinc-400"
 
-  defp format_loss(nil), do: "—"
-  defp format_loss(loss) when is_float(loss), do: :erlang.float_to_binary(loss, decimals: 6)
-  defp format_loss(loss), do: to_string(loss)
+  defp fmt_loss(nil), do: "—"
+  defp fmt_loss(l) when is_float(l), do: :erlang.float_to_binary(l, decimals: 6)
+  defp fmt_loss(l), do: to_string(l)
 
   attr :label, :string, required: true
   attr :value, :any, required: true
-
-  defp stat_card(assigns) do
+  defp stat(assigns) do
     ~H"""
     <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
       <div class="text-zinc-500 text-xs uppercase tracking-wider">{@label}</div>
