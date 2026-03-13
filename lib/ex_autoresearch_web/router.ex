@@ -50,13 +50,12 @@ defmodule ExAutoresearchWeb.Router do
     end
   end
 
-  if Application.compile_env(:ex_autoresearch, :dev_routes) do
-    import AshAdmin.Router
-
-    scope "/admin" do
-      pipe_through :browser
-
-      ash_admin "/"
-    end
-  end
+  # AshAdmin disabled — conflicts with jido's gettext requirement
+  # if Application.compile_env(:ex_autoresearch, :dev_routes) do
+  #   import AshAdmin.Router
+  #   scope "/admin" do
+  #     pipe_through :browser
+  #     ash_admin "/"
+  #   end
+  # end
 end

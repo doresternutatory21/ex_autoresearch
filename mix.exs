@@ -75,7 +75,7 @@ defmodule ExAutoresearch.MixProject do
       {:live_debugger, "~> 0.6", only: [:dev]},
       {:oban_web, "~> 2.0"},
       {:ash_oban, "~> 0.7"},
-      {:ash_admin, "~> 0.14"},
+      # {:ash_admin, "~> 0.14"},  # conflicts with jido's gettext requirement
       {:ash_sqlite, "~> 0.2"},
       {:ash_phoenix, "~> 2.0"},
       {:ash, "~> 3.0"},
@@ -102,7 +102,7 @@ defmodule ExAutoresearch.MixProject do
       {:req, "~> 0.5"},
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
-      {:gettext, "~> 1.0"},
+      {:gettext, "~> 0.26"},
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.2.0"},
       {:bandit, "~> 1.5"},
@@ -116,9 +116,13 @@ defmodule ExAutoresearch.MixProject do
       # Data
       # {:arrow, "~> 0.1", only: [:dev, :test]},
 
-      # Agent / LLM
-      # {:jido, path: Path.expand("../../agentjido/jido")},
-      # {:jido_ghcopilot, path: Path.expand("../../agentjido/jido_ghcopilot")},
+      # Agent / LLM (GitHub Copilot via Server protocol)
+      {:jido_ghcopilot, path: Path.expand("~/github/agentjido/jido_ghcopilot")},
+      # Required transitive overrides (not on hex.pm)
+      {:jido_shell, path: Path.expand("~/github/agentjido/jido_shell"), override: true},
+      {:jido_harness, path: Path.expand("~/github/agentjido/jido_harness"), override: true},
+      {:jido_vfs, path: Path.expand("~/github/agentjido/jido_vfs"), override: true},
+      {:sprites, github: "mikehostetler/sprites-ex", override: true},
     ]
   end
 

@@ -23,6 +23,7 @@ defmodule ExAutoresearch.Application do
       {DNSCluster, query: Application.get_env(:ex_autoresearch, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: ExAutoresearch.PubSub},
       ExAutoresearch.Experiments.Registry,
+      ExAutoresearch.Agent.LLM,
       ExAutoresearch.Training.Trainer,
       ExAutoresearch.Agent.Researcher,
       ExAutoresearchWeb.Endpoint
