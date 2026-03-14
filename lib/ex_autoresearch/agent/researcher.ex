@@ -255,13 +255,14 @@ defmodule ExAutoresearch.Agent.Researcher do
 
             result = Runner.run(module, version_id: version_id, time_budget: run.time_budget)
 
-            kept = decide_keep(result[:loss], best && best.final_loss)
+            loss = sanitize_loss(result[:loss])
+            kept = decide_keep(loss, best && best.final_loss)
 
             experiment = Registry.complete_trial(experiment, %{
-              final_loss: result[:loss],
+              final_loss: loss,
               num_steps: result[:steps],
               training_seconds: result[:training_seconds],
-              status: if(result[:loss], do: :completed, else: :crashed),
+              status: if(loss, do: :completed, else: :crashed),
               kept: kept
             })
 
@@ -338,6 +339,16 @@ defmodule ExAutoresearch.Agent.Researcher do
 
   defp safe_round(val, d) when is_float(val), do: Float.round(val, d)
   defp safe_round(val, _d), do: val
+
+  # NaN, Inf, and atoms like :nan are not valid float values for SQLite
+  defp sanitize_loss(nil), do: nil
+  defp sanitize_loss(:nan), do: nil
+  defp sanitize_loss(:infinity), do: nil
+  defp sanitize_loss(:neg_infinity), do: nil
+  defp sanitize_loss(v) when is_float(v) do
+    if v != v or v == :math.exp(800), do: nil, else: v
+  end
+  defp sanitize_loss(_), do: nil
 
   defp default_tag do
     {{y, m, d}, _} = :calendar.local_time()
