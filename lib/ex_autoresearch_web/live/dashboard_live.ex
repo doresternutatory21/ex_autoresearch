@@ -42,7 +42,7 @@ defmodule ExAutoresearchWeb.DashboardLive do
 
   @impl true
   def handle_event("start_research", _params, socket) do
-    Researcher.start_research()
+    Researcher.start_research(tag: socket.assigns.campaign_tag, model: socket.assigns.current_model)
     {:noreply, assign(socket, :agent_status, :running)}
   end
 
@@ -74,13 +74,14 @@ defmodule ExAutoresearchWeb.DashboardLive do
   @impl true
   def handle_info(:tick, socket) do
     agent = Researcher.status()
+    # Only update data fields from DB, not user-controlled ones (model, status)
+    # Status and model come from PubSub events to avoid races
     {:noreply,
      socket
-     |> assign(:agent_status, agent.status)
      |> assign(:best_loss, agent.best_loss)
      |> assign(:best_version, agent.best_version)
      |> assign(:trial_count, agent.trial_count)
-     |> assign(:campaign_tag, agent.campaign_tag)}
+     |> assign(:campaign_tag, agent.campaign_tag || socket.assigns.campaign_tag)}
   end
 
   @impl true
@@ -123,7 +124,11 @@ defmodule ExAutoresearchWeb.DashboardLive do
   @impl true
   def handle_info({:agent_responded, p}, socket), do: {:noreply, add_log(socket, "💡 #{p[:reasoning] || "..."}")}
   @impl true
-  def handle_info({:status_changed, p}, socket), do: {:noreply, assign(socket, :agent_status, p[:status])}
+  def handle_info({:status_changed, p}, socket) do
+    socket = assign(socket, :agent_status, p[:status])
+    socket = if p[:model], do: assign(socket, :current_model, p[:model]), else: socket
+    {:noreply, socket}
+  end
   @impl true
   def handle_info(_, socket), do: {:noreply, socket}
 
