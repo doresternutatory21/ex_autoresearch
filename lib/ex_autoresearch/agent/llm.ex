@@ -29,6 +29,7 @@ defmodule ExAutoresearch.Agent.LLM do
   """
   def prompt(text, opts \\ []) do
     system = Keyword.get(opts, :system)
+    model = Keyword.get(opts, :model)
 
     full_prompt =
       if system do
@@ -37,7 +38,7 @@ defmodule ExAutoresearch.Agent.LLM do
         text
       end
 
-    GenServer.call(__MODULE__, {:prompt, full_prompt}, :infinity)
+    GenServer.call(__MODULE__, {:prompt, full_prompt, model}, :infinity)
   end
 
   @doc "Check if the connection is alive."
@@ -83,8 +84,23 @@ defmodule ExAutoresearch.Agent.LLM do
   end
 
   @impl true
-  def handle_call({:prompt, text}, from, %{status: :idle} = state) do
-    Logger.debug("LLM prompt (#{String.length(text)} chars)")
+  def handle_call({:prompt, text, requested_model}, from, %{status: :idle} = state) do
+    # Switch model if different from current
+    state =
+      if requested_model && requested_model != state.model do
+        case switch_model(state, requested_model) do
+          {:ok, new_state} ->
+            Logger.info("LLM switched to model: #{requested_model}")
+            new_state
+          {:error, reason} ->
+            Logger.warning("Model switch failed: #{inspect(reason)}, using #{state.model}")
+            state
+        end
+      else
+        state
+      end
+
+    Logger.debug("LLM prompt (#{String.length(text)} chars, model: #{state.model})")
 
     case Connection.send_prompt(state.conn, state.session_id, text) do
       {:ok, _msg_id} ->
@@ -95,7 +111,7 @@ defmodule ExAutoresearch.Agent.LLM do
     end
   end
 
-  def handle_call({:prompt, _text}, _from, state) do
+  def handle_call({:prompt, _text, _model}, _from, state) do
     {:reply, {:error, {:not_ready, state.status}}, state}
   end
 
@@ -151,4 +167,20 @@ defmodule ExAutoresearch.Agent.LLM do
     Connection.stop(conn)
   end
   def terminate(_, _), do: :ok
+
+  # Create a new session with a different model on the same connection
+  defp switch_model(%{conn: conn, session_id: old_sid} = state, new_model) do
+    if old_sid, do: Connection.unsubscribe(conn, old_sid)
+
+    case Connection.create_session(conn, %{model: new_model}) do
+      {:ok, new_sid} ->
+        :ok = Connection.subscribe(conn, new_sid)
+        {:ok, %{state | session_id: new_sid, model: new_model}}
+
+      {:error, reason} ->
+        # Re-subscribe to old session on failure
+        if old_sid, do: Connection.subscribe(conn, old_sid)
+        {:error, reason}
+    end
+  end
 end

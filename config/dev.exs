@@ -1,6 +1,9 @@
 import Config
 config :ash, policies: [show_policy_breakdowns?: true]
 
+# LiveDebugger on a different port to avoid conflicts
+config :live_debugger, LiveDebugger.App.Web.Endpoint, http: [port: 4027]
+
 # Configure your database
 config :ex_autoresearch, ExAutoresearch.Repo,
   database: Path.expand("../ex_autoresearch_dev.db", __DIR__),

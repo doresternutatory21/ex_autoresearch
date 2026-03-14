@@ -1,4 +1,12 @@
 defmodule ExAutoresearch.Research.Experiment do
+  @moduledoc """
+  A single experiment — one version of the model, trained and evaluated.
+
+  Stores everything: the Elixir source code, the config, training results,
+  which LLM model proposed it, and whether it was kept or discarded.
+  This is the lab notebook entry.
+  """
+
   use Ash.Resource,
     domain: ExAutoresearch.Research,
     data_layer: AshSqlite.DataLayer
@@ -9,40 +17,56 @@ defmodule ExAutoresearch.Research.Experiment do
   end
 
   actions do
-    defaults [:read, :destroy]
+    defaults [:read]
 
     create :record do
       accept [
-        :experiment_id,
+        :run_id,
+        :version_id,
         :status,
+        :code,
+        :description,
+        :reasoning,
+        :parent_id,
+        :model,
         :config,
         :final_loss,
         :training_seconds,
         :num_steps,
-        :n_layer,
-        :n_embd,
-        :description,
         :kept,
-        :reasoning
+        :error
       ]
+    end
+
+    update :complete do
+      accept [:status, :final_loss, :training_seconds, :num_steps, :kept, :error]
     end
   end
 
   attributes do
     uuid_v7_primary_key :id
 
-    attribute :experiment_id, :string, allow_nil?: false
-    attribute :status, :atom, constraints: [one_of: [:completed, :crashed, :running]], default: :running
+    attribute :run_id, :uuid_v7, allow_nil?: false
+    attribute :version_id, :string, allow_nil?: false
+    attribute :status, :atom,
+      constraints: [one_of: [:pending, :running, :completed, :crashed, :discarded]],
+      default: :pending
+    attribute :code, :string, allow_nil?: true
+    attribute :description, :string
+    attribute :reasoning, :string
+    attribute :parent_id, :uuid_v7
+    attribute :model, :string
     attribute :config, :map
     attribute :final_loss, :float
     attribute :training_seconds, :float
     attribute :num_steps, :integer
-    attribute :n_layer, :integer
-    attribute :n_embd, :integer
-    attribute :description, :string
     attribute :kept, :boolean, default: false
-    attribute :reasoning, :string
+    attribute :error, :string
 
     timestamps()
+  end
+
+  relationships do
+    belongs_to :run, ExAutoresearch.Research.Run
   end
 end

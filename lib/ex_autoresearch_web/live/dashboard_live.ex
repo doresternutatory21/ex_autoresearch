@@ -12,12 +12,23 @@ defmodule ExAutoresearchWeb.DashboardLive do
     end
 
     agent = Researcher.status()
-    experiments =
-      Registry.all()
-      |> Enum.map(fn exp -> exp |> Map.from_struct() |> Map.put(:id, exp.version_id) end)
+    experiments = Researcher.experiments()
+      |> Enum.map(fn exp ->
+        %{id: exp.version_id, version_id: exp.version_id, loss: exp.final_loss,
+          steps: exp.num_steps, training_seconds: exp.training_seconds,
+          description: exp.description, kept: exp.kept, status: exp.status,
+          model: exp.model}
+      end)
 
-    best = Registry.best()
-    selected = if best, do: load_version(best.version_id), else: nil
+    selected =
+      if agent.best_version do
+        load_version(agent.best_version)
+      else
+        nil
+      end
+
+    models = Jido.GHCopilot.Models.all()
+    current_model = agent.model || "claude-sonnet-4"
 
     socket =
       socket
@@ -29,6 +40,8 @@ defmodule ExAutoresearchWeb.DashboardLive do
       |> assign(:current_progress, nil)
       |> assign(:agent_log, [])
       |> assign(:selected, selected)
+      |> assign(:models, models)
+      |> assign(:current_model, current_model)
       |> stream(:experiments, experiments)
 
     {:ok, socket}
@@ -53,8 +66,15 @@ defmodule ExAutoresearchWeb.DashboardLive do
 
   @impl true
   def handle_event("select_best", _params, socket) do
-    best = Registry.best()
-    {:noreply, assign(socket, :selected, if(best, do: load_version(best.version_id)))}
+    agent = Researcher.status()
+    selected = if agent.best_version, do: load_version(agent.best_version), else: nil
+    {:noreply, assign(socket, :selected, selected)}
+  end
+
+  @impl true
+  def handle_event("change_model", %{"model" => model_id}, socket) do
+    Researcher.set_model(model_id)
+    {:noreply, socket |> assign(:current_model, model_id) |> add_log("🔄 Model → #{model_id}")}
   end
 
   @impl true
@@ -82,7 +102,8 @@ defmodule ExAutoresearchWeb.DashboardLive do
     tag = if r[:kept], do: "✅ kept", else: "❌ discarded"
     entry = %{id: r[:version_id], version_id: r[:version_id], loss: r[:loss],
               steps: r[:steps], training_seconds: r[:training_seconds],
-              description: r[:description], kept: r[:kept], status: r[:status]}
+              description: r[:description], kept: r[:kept], status: r[:status],
+              model: r[:model]}
 
     socket =
       socket
@@ -118,16 +139,26 @@ defmodule ExAutoresearchWeb.DashboardLive do
   end
 
   defp load_version(vid) do
-    case Registry.get(vid) do
-      {:ok, exp} -> %{version_id: exp.version_id, code: exp.code || "(no source)", loss: exp.loss,
-                       steps: exp.steps, description: exp.description, kept: exp.kept, status: exp.status}
-      :error -> nil
+    case Registry.get_experiment(vid) do
+      {:ok, nil} -> nil
+      {:ok, exp} -> %{version_id: exp.version_id, code: exp.code || "(no source)",
+                       loss: exp.final_loss, steps: exp.num_steps, description: exp.description,
+                       kept: exp.kept, status: exp.status, model: exp.model}
+      _ -> nil
     end
   end
 
   defp safe_fmt(nil), do: "—"
   defp safe_fmt(l) when is_float(l), do: :erlang.float_to_binary(l, decimals: 6)
   defp safe_fmt(l), do: to_string(l)
+
+  defp short_model(nil), do: "—"
+  defp short_model(m) do
+    m
+    |> String.replace("claude-", "")
+    |> String.replace("gpt-", "gpt")
+    |> String.replace("-preview", "")
+  end
 
   @impl true
   def render(assigns) do
@@ -141,6 +172,14 @@ defmodule ExAutoresearchWeb.DashboardLive do
             <p class="text-zinc-400 text-sm">BEAM-native autonomous GPT research · Hot-loaded versioned modules</p>
           </div>
           <div class="flex items-center gap-3">
+            <select phx-change="change_model" name="model"
+              class="bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-3 py-1.5 focus:ring-indigo-500 focus:border-indigo-500">
+              <%= for {name, id, mult} <- @models do %>
+                <option value={id} selected={id == @current_model}>
+                  <%= name %><%= if mult > 1, do: " (#{mult}×)", else: "" %>
+                </option>
+              <% end %>
+            </select>
             <span class={["px-3 py-1 rounded-full text-sm font-medium", status_class(@agent_status)]}>
               {@agent_status}
             </span>
@@ -172,6 +211,7 @@ defmodule ExAutoresearchWeb.DashboardLive do
                     <th class="text-left py-1.5 px-2">Version</th>
                     <th class="text-left py-1.5 px-2">Loss</th>
                     <th class="text-right py-1.5 px-2">Steps</th>
+                    <th class="text-left py-1.5 px-2">Model</th>
                     <th class="text-center py-1.5 px-2"></th>
                   </tr>
                 </thead>
@@ -189,6 +229,7 @@ defmodule ExAutoresearchWeb.DashboardLive do
                     </td>
                     <td class="py-1.5 px-2 font-mono text-zinc-300 text-sm">{safe_fmt(exp[:loss])}</td>
                     <td class="py-1.5 px-2 text-right text-zinc-500 text-xs">{exp[:steps] || "—"}</td>
+                    <td class="py-1.5 px-2 text-xs text-zinc-500">{short_model(exp[:model])}</td>
                     <td class="py-1.5 px-2 text-center">
                       {if exp[:kept], do: "✅", else: if(exp[:status] == :crashed, do: "💥", else: "❌")}
                     </td>

@@ -1,10 +1,10 @@
 defmodule ExAutoresearch.Agent.Researcher do
   @moduledoc """
-  Autonomous experiment loop with hot-loaded versioned modules.
+  Autonomous experiment loop with full persistence.
 
-  The LLM generates complete Elixir modules that define GPT models.
-  Each version is compiled and loaded into the running BEAM.
-  The best versions survive; worse ones are discarded but preserved.
+  All state lives in SQLite via Ash. Stops and resumes are seamless —
+  the agent picks up where it left off by loading experiment history.
+  Model can be switched mid-flight via set_model/1.
   """
 
   use GenServer
@@ -14,7 +14,7 @@ defmodule ExAutoresearch.Agent.Researcher do
   alias ExAutoresearch.Experiments.{Registry, Loader, Runner}
   alias ExAutoresearch.Agent.{LLM, Prompts}
 
-  @status_table __MODULE__.Status
+  defstruct [:run_id, :task, status: :idle]
 
   # Client API
 
@@ -22,57 +22,120 @@ defmodule ExAutoresearch.Agent.Researcher do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def start_research(opts \\ []), do: GenServer.cast(__MODULE__, {:start_research, opts})
-  def stop_research, do: put_status(:status, :stopping)
+  @doc "Start or resume a research run with the given tag."
+  def start_research(opts \\ []) do
+    GenServer.cast(__MODULE__, {:start_research, opts})
+  end
 
+  @doc "Stop the experiment loop after current experiment finishes."
+  def stop_research do
+    GenServer.cast(__MODULE__, :stop_research)
+  end
+
+  @doc "Switch the LLM model mid-flight. Takes effect on the next experiment."
+  def set_model(model_id) when is_binary(model_id) do
+    GenServer.cast(__MODULE__, {:set_model, model_id})
+  end
+
+  @doc "Get current status (reads from SQLite, never blocks)."
   def status do
-    best = Registry.best()
-    %{
-      status: get_status(:status, :idle),
-      experiment_count: Registry.count(),
-      best_loss: best && best.loss,
-      best_version: best && best.version_id,
-      model: get_status(:model, "claude-sonnet-4")
-    }
+    case Registry.active_run() do
+      {:ok, nil} -> %{status: :idle, experiment_count: 0, best_loss: nil, best_version: nil, model: "claude-sonnet-4", run_tag: nil}
+      {:ok, run} ->
+        best = Registry.best_experiment(run.id)
+        %{
+          status: run.status,
+          run_tag: run.tag,
+          experiment_count: Registry.count_experiments(run.id),
+          best_loss: best && best.final_loss,
+          best_version: best && best.version_id,
+          model: run.model
+        }
+    end
+  rescue
+    _ -> %{status: :idle, experiment_count: 0, best_loss: nil, best_version: nil, model: "claude-sonnet-4", run_tag: nil}
+  end
+
+  @doc "Get all experiments for the active run."
+  def experiments do
+    case Registry.active_run() do
+      {:ok, nil} -> []
+      {:ok, run} -> Registry.all_experiments(run.id)
+    end
+  rescue
+    _ -> []
   end
 
   # Server
 
   @impl true
-  def init(opts) do
-    :ets.new(@status_table, [:named_table, :set, :public, read_concurrency: true])
-    put_status(:status, :idle)
-    put_status(:model, Keyword.get(opts, :model, "claude-sonnet-4"))
-    put_status(:time_budget, Keyword.get(opts, :time_budget, 15))
-    {:ok, %{task: nil}}
+  def init(_opts) do
+    {:ok, %__MODULE__{}}
   end
 
   @impl true
   def handle_cast({:start_research, opts}, state) do
-    if opts[:model], do: put_status(:model, opts[:model])
-    if opts[:time_budget], do: put_status(:time_budget, opts[:time_budget])
+    tag = Keyword.get(opts, :tag, default_tag())
+    model = Keyword.get(opts, :model, "claude-sonnet-4")
+    time_budget = Keyword.get(opts, :time_budget, 15)
 
-    put_status(:status, :running)
+    # Resume existing run or create new one
+    run = case Registry.get_run(tag) do
+      {:ok, nil} ->
+        Logger.info("Creating new run: #{tag}")
+        Registry.start_run(tag, model: model, time_budget: time_budget)
+      {:ok, existing} ->
+        Logger.info("Resuming run: #{tag} (#{Registry.count_experiments(existing.id)} experiments)")
+        Registry.resume_run(existing)
+    end
+
     broadcast(:status_changed, %{status: :running})
 
-    task = Task.async(fn -> experiment_loop() end)
-    {:noreply, %{state | task: task}}
+    task = Task.async(fn -> experiment_loop(run) end)
+    {:noreply, %{state | run_id: run.id, task: task, status: :running}}
+  end
+
+  @impl true
+  def handle_cast(:stop_research, state) do
+    Logger.info("Stop requested — will stop after current experiment")
+
+    if state.run_id do
+      case Registry.get_run_by_id(state.run_id) do
+        {:ok, run} when not is_nil(run) -> Registry.pause_run(run)
+        _ -> :ok
+      end
+    end
+
+    {:noreply, %{state | status: :stopping}}
+  end
+
+  @impl true
+  def handle_cast({:set_model, model_id}, state) do
+    Logger.info("Switching model to: #{model_id}")
+
+    if state.run_id do
+      case Registry.get_run_by_id(state.run_id) do
+        {:ok, run} when not is_nil(run) -> Registry.update_run_model(run, model_id)
+        _ -> :ok
+      end
+    end
+
+    broadcast(:status_changed, %{status: state.status, model: model_id})
+    {:noreply, state}
   end
 
   @impl true
   def handle_info({ref, _result}, %{task: %Task{ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
-    put_status(:status, :idle)
     broadcast(:status_changed, %{status: :idle})
-    {:noreply, %{state | task: nil}}
+    {:noreply, %{state | task: nil, status: :idle}}
   end
 
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{task: %Task{ref: ref}} = state) do
     Logger.error("Experiment loop crashed: #{inspect(reason, limit: 3)}")
-    put_status(:status, :idle)
     broadcast(:status_changed, %{status: :idle})
-    {:noreply, %{state | task: nil}}
+    {:noreply, %{state | task: nil, status: :idle}}
   end
 
   @impl true
@@ -80,37 +143,39 @@ defmodule ExAutoresearch.Agent.Researcher do
 
   # --- Experiment loop ---
 
-  defp experiment_loop do
+  defp experiment_loop(run) do
     # Run baseline if no experiments yet
-    if Registry.count() == 0 do
-      Logger.info("Loading baseline module...")
-      run_baseline()
+    if Registry.count_experiments(run.id) == 0 do
+      Logger.info("[#{run.tag}] Running baseline...")
+      run_baseline(run)
     end
 
-    loop()
+    loop(run)
   end
 
-  defp loop do
-    if get_status(:status) == :running do
-      case propose_and_run() do
-        :ok -> loop()
+  defp loop(run) do
+    # Re-read run from DB to get latest status/model (may have been changed mid-flight)
+    run = Ash.get!(ExAutoresearch.Research.Run, run.id)
+
+    if run.status == :running do
+      case propose_and_run(run) do
+        :ok -> loop(run)
         {:error, reason} ->
           Logger.error("Experiment failed: #{inspect(reason, limit: 3)}")
           Process.sleep(3_000)
-          loop()
+          loop(run)
       end
     else
-      Logger.info("Research loop stopped")
+      Logger.info("[#{run.tag}] Research loop stopped")
     end
   end
 
-  defp run_baseline do
+  defp run_baseline(run) do
     version_id = gen_id()
     template = Prompts.read("template.md")
 
-    # Extract the code block from the template
     code = case Regex.run(~r/```elixir\n(.*?)```/s, template) do
-      [_, elixir_code] -> elixir_code
+      [_, c] -> c
       _ -> template
     end
 
@@ -118,108 +183,115 @@ defmodule ExAutoresearch.Agent.Researcher do
 
     case Loader.load(version_id, code) do
       {:ok, module} ->
-        Registry.register(version_id, %{
-          module: module,
+        Registry.cache_module(version_id, module)
+
+        experiment = Registry.record_experiment(%{
+          run_id: run.id,
+          version_id: version_id,
           code: code,
           description: "baseline",
-          parent_id: nil,
-          status: :running,
-          kept: false,
-          loaded_at: DateTime.utc_now()
+          model: run.model,
+          status: :running
         })
 
         broadcast(:experiment_started, %{version_id: version_id, description: "baseline"})
 
-        result = Runner.run(module, version_id: version_id, time_budget: get_status(:time_budget, 15))
+        result = Runner.run(module, version_id: version_id, time_budget: run.time_budget)
 
-        Registry.update(version_id, %{
-          loss: result[:loss],
-          steps: result[:steps],
+        experiment = Registry.complete_experiment(experiment, %{
+          final_loss: result[:loss],
+          num_steps: result[:steps],
           training_seconds: result[:training_seconds],
-          status: result[:status],
-          kept: true
+          status: if(result[:loss], do: :completed, else: :crashed),
+          kept: result[:loss] != nil
         })
 
-        broadcast(:experiment_completed, Map.merge(result, %{description: "baseline", kept: true}))
+        if result[:loss], do: Registry.update_run_best(run, experiment.id)
 
-        Logger.info("Baseline established: loss=#{result[:loss]}")
+        broadcast(:experiment_completed, Map.merge(result, %{
+          description: "baseline", kept: result[:loss] != nil, model: run.model
+        }))
 
       {:error, reason} ->
         Logger.error("Baseline failed to load: #{inspect(reason)}")
     end
   end
 
-  defp propose_and_run do
+  defp propose_and_run(run) do
     version_id = gen_id()
-    best = Registry.best()
-    history = Registry.all()
+    all_exps = Registry.all_experiments(run.id)
+    best = Registry.best_experiment(run.id)
+    kept = Registry.kept_experiments(run.id)
 
     # Build prompt with full context
-    prompt = Prompts.build_proposal_prompt(history, best, version_id)
+    prompt = Prompts.build_proposal_prompt(all_exps, best, kept, version_id)
 
-    Logger.info("Asking LLM for experiment v_#{version_id}...")
+    Logger.info("[#{run.tag}] Asking #{run.model} for experiment v_#{version_id}...")
     broadcast(:agent_thinking, %{version_id: version_id})
 
-    case LLM.prompt(prompt, system: Prompts.system_prompt(), model: get_status(:model)) do
+    case LLM.prompt(prompt, system: Prompts.system_prompt(), model: run.model) do
       {:ok, response} ->
-        # Extract code and reasoning from response
         {code, description, reasoning} = parse_response(response, version_id)
-
         broadcast(:agent_responded, %{reasoning: reasoning, description: description})
 
-        # Load and run
         code = Loader.inject_version_id(code, version_id)
 
         case Loader.load(version_id, code) do
           {:ok, module} ->
-            parent_id = best && best.version_id
+            Registry.cache_module(version_id, module)
 
-            Registry.register(version_id, %{
-              module: module,
+            experiment = Registry.record_experiment(%{
+              run_id: run.id,
+              version_id: version_id,
               code: code,
               description: description,
-              parent_id: parent_id,
-              status: :running,
-              kept: false,
-              loaded_at: DateTime.utc_now()
+              reasoning: reasoning,
+              parent_id: best && best.id,
+              model: run.model,
+              status: :running
             })
 
             broadcast(:experiment_started, %{version_id: version_id, description: description})
 
-            result = Runner.run(module, version_id: version_id, time_budget: get_status(:time_budget, 15))
+            result = Runner.run(module, version_id: version_id, time_budget: run.time_budget)
 
-            # Decide
-            {kept, _} = decide(result[:loss], best && best.loss)
+            kept = decide_keep(result[:loss], best && best.final_loss)
 
-            Registry.update(version_id, %{
-              loss: result[:loss],
-              steps: result[:steps],
+            experiment = Registry.complete_experiment(experiment, %{
+              final_loss: result[:loss],
+              num_steps: result[:steps],
               training_seconds: result[:training_seconds],
-              status: result[:status],
+              status: if(result[:loss], do: :completed, else: :crashed),
               kept: kept
             })
 
-            broadcast(:experiment_completed, Map.merge(result, %{description: description, kept: kept}))
+            if kept, do: Registry.update_run_best(run, experiment.id)
+
+            broadcast(:experiment_completed, Map.merge(result, %{
+              description: description, kept: kept, model: run.model
+            }))
 
             :ok
 
           {:error, reason} ->
             Logger.error("Module v_#{version_id} failed to load: #{inspect(reason)}")
 
-            Registry.register(version_id, %{
-              module: nil,
+            Registry.record_experiment(%{
+              run_id: run.id,
+              version_id: version_id,
               code: code,
               description: description,
-              parent_id: best && best.version_id,
+              reasoning: reasoning,
+              parent_id: best && best.id,
+              model: run.model,
               status: :crashed,
-              kept: false,
-              loaded_at: DateTime.utc_now()
+              error: inspect(reason)
             })
 
             broadcast(:experiment_completed, %{
               version_id: version_id, description: description,
               kept: false, status: :crashed, loss: nil, steps: 0,
-              error: inspect(reason)
+              model: run.model, error: inspect(reason)
             })
 
             :ok
@@ -231,56 +303,46 @@ defmodule ExAutoresearch.Agent.Researcher do
   end
 
   defp parse_response(response, version_id) do
-    # Try to extract code block
     code = case Regex.run(~r/```elixir\n(.*?)```/s, response) do
-      [_, elixir_code] -> elixir_code
+      [_, c] -> c
       _ -> response
     end
 
-    # Try to extract reasoning (may be outside code block)
-    reasoning = case Regex.run(~r/(?:reasoning|rationale|why)[:\s]*(.+?)(?:\n\n|```)/si, response) do
-      [_, r] -> String.trim(r)
+    reasoning = case Regex.run(~r/"reasoning"\s*:\s*"([^"]+)"/s, response) do
+      [_, r] -> r
       _ ->
-        # Try JSON format
-        case Regex.run(~r/"reasoning"\s*:\s*"([^"]+)"/s, response) do
-          [_, r] -> r
+        case Regex.run(~r/@moduledoc\s+"([^"]+)"/s, code) do
+          [_, d] -> d
           _ -> String.slice(response, 0, 200)
         end
     end
 
-    # Try to extract description from @moduledoc
     description = case Regex.run(~r/@moduledoc\s+"([^"]+)"/s, code) do
-      [_, d] -> d
+      [_, d] -> String.slice(d, 0, 300)
       _ -> "LLM experiment v_#{version_id}"
     end
 
     {code, description, reasoning}
   end
 
-  defp decide(nil, _baseline), do: {false, nil}
-  defp decide(loss, nil) do
-    Logger.info("✅ Baseline: loss=#{loss}")
-    {true, loss}
+  defp decide_keep(nil, _baseline), do: false
+  defp decide_keep(_loss, nil), do: true
+  defp decide_keep(loss, baseline) when loss < baseline do
+    Logger.info("✅ Improvement! #{safe_round(baseline, 6)} → #{safe_round(loss, 6)}")
+    true
   end
-  defp decide(loss, baseline) when loss < baseline do
-    Logger.info("✅ Improvement! #{baseline} → #{loss} (Δ#{safe_round(baseline - loss, 6)})")
-    {true, loss}
-  end
-  defp decide(loss, baseline) do
-    Logger.info("❌ No improvement: #{loss} >= #{baseline}")
-    {false, baseline}
+  defp decide_keep(loss, baseline) do
+    Logger.info("❌ No improvement: #{safe_round(loss, 6)} >= #{safe_round(baseline, 6)}")
+    false
   end
 
-  # --- Helpers ---
+  defp safe_round(val, d) when is_float(val), do: Float.round(val, d)
+  defp safe_round(val, _d), do: val
 
-  defp put_status(key, value), do: :ets.insert(@status_table, {key, value})
-  defp get_status(key, default \\ nil) do
-    case :ets.lookup(@status_table, key) do
-      [{^key, value}] -> value
-      [] -> default
-    end
-  rescue
-    ArgumentError -> default
+  defp default_tag do
+    {{y, m, d}, _} = :calendar.local_time()
+    month = Enum.at(~w(jan feb mar apr may jun jul aug sep oct nov dec), m - 1)
+    "#{month}#{d}"
   end
 
   defp broadcast(event, payload) do
@@ -288,10 +350,6 @@ defmodule ExAutoresearch.Agent.Researcher do
   rescue
     _ -> :ok
   end
-
-  defp safe_round(val, decimals) when is_float(val), do: Float.round(val, decimals)
-  defp safe_round(val, _d) when is_integer(val), do: val / 1
-  defp safe_round(_, _), do: nil
 
   defp gen_id, do: :crypto.strong_rand_bytes(4) |> Base.hex_encode32(case: :lower, padding: false)
 end

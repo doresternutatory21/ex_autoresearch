@@ -1,91 +1,171 @@
 defmodule ExAutoresearch.Experiments.Registry do
   @moduledoc """
-  Version registry for hot-loaded experiment modules.
+  Experiment registry backed by Ash/SQLite.
 
-  Stores all experiment versions in ETS with their source code, loss,
-  and metadata. Modules live in the BEAM simultaneously — no restarts needed.
+  All state is persisted — stops and resumes are seamless.
+  Also maintains an ETS cache of loaded modules for fast access
+  (modules can't be stored in SQLite, they're recompiled on resume).
   """
 
   use GenServer
 
   require Logger
+  require Ash.Query
 
-  @table __MODULE__
+  alias ExAutoresearch.Research.{Run, Experiment}
+  alias ExAutoresearch.Experiments.Loader
 
-  defstruct [:version_id, :module, :code, :description, :parent_id,
-             :loss, :steps, :training_seconds, :status, :kept, :loaded_at]
+  @modules_table __MODULE__.Modules
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  # --- Reads (direct ETS, never block) ---
+  # --- Run management ---
 
-  def all do
-    :ets.tab2list(@table)
-    |> Enum.map(fn {_id, entry} -> entry end)
-    |> Enum.sort_by(& &1.loaded_at, DateTime)
-  rescue
-    ArgumentError -> []
+  def start_run(tag, opts \\ []) do
+    model = Keyword.get(opts, :model, "claude-sonnet-4")
+    time_budget = Keyword.get(opts, :time_budget, 15)
+    base_config = Keyword.get(opts, :base_config, %{})
+
+    Ash.create!(Run, %{
+      tag: tag,
+      model: model,
+      time_budget: time_budget,
+      base_config: base_config
+    })
   end
 
-  def get(version_id) do
-    case :ets.lookup(@table, version_id) do
-      [{^version_id, entry}] -> {:ok, entry}
-      [] -> :error
+  def get_run(tag) do
+    Run
+    |> Ash.Query.filter(tag == ^tag)
+    |> Ash.read_one()
+  end
+
+  def get_run!(tag) do
+    case get_run(tag) do
+      {:ok, run} -> run
+      {:error, reason} -> raise "Run '#{tag}' not found: #{inspect(reason)}"
+    end
+  end
+
+  def get_run_by_id(id) do
+    case Ash.get(Run, id) do
+      {:ok, run} -> {:ok, run}
+      {:error, _} -> {:ok, nil}
+    end
+  end
+
+  def active_run do
+    Run
+    |> Ash.Query.filter(status == :running)
+    |> Ash.Query.sort(updated_at: :desc)
+    |> Ash.Query.limit(1)
+    |> Ash.read_one()
+  end
+
+  def pause_run(run) do
+    Ash.update!(run, %{status: :paused}, action: :update_status)
+  end
+
+  def resume_run(run) do
+    Ash.update!(run, %{status: :running}, action: :update_status)
+  end
+
+  def update_run_model(run, model) do
+    Ash.update!(run, %{model: model}, action: :update_status)
+  end
+
+  def update_run_best(run, experiment_id) do
+    Ash.update!(run, %{best_experiment_id: experiment_id}, action: :update_status)
+  end
+
+  # --- Experiment CRUD (SQLite-backed) ---
+
+  def all_experiments(run_id) do
+    Experiment
+    |> Ash.Query.filter(run_id == ^run_id)
+    |> Ash.Query.sort(inserted_at: :asc)
+    |> Ash.read!()
+  end
+
+  def get_experiment(version_id) do
+    Experiment
+    |> Ash.Query.filter(version_id == ^version_id)
+    |> Ash.read_one()
+  end
+
+  def count_experiments(run_id) do
+    Experiment
+    |> Ash.Query.filter(run_id == ^run_id)
+    |> Ash.count!()
+  end
+
+  def best_experiment(run_id) do
+    Experiment
+    |> Ash.Query.filter(run_id == ^run_id and kept == true and not is_nil(final_loss))
+    |> Ash.Query.sort(final_loss: :asc)
+    |> Ash.Query.limit(1)
+    |> Ash.read_one!()
+  end
+
+  def kept_experiments(run_id) do
+    Experiment
+    |> Ash.Query.filter(run_id == ^run_id and kept == true and not is_nil(code))
+    |> Ash.Query.sort(final_loss: :asc)
+    |> Ash.read!()
+  end
+
+  def record_experiment(attrs) do
+    Ash.create!(Experiment, attrs, action: :record)
+  end
+
+  def complete_experiment(experiment, attrs) do
+    Ash.update!(experiment, attrs, action: :complete)
+  end
+
+  # --- Module cache (ETS, rebuilt on resume) ---
+
+  def get_module(version_id) do
+    case :ets.lookup(@modules_table, version_id) do
+      [{^version_id, module}] -> {:ok, module}
+      [] -> :not_loaded
     end
   rescue
-    ArgumentError -> :error
+    ArgumentError -> :not_loaded
   end
 
-  def best do
-    all()
-    |> Enum.filter(& &1.kept)
-    |> Enum.filter(& &1.loss)
-    |> Enum.min_by(& &1.loss, fn -> nil end)
-  end
-
-  def count do
-    :ets.info(@table, :size)
+  def cache_module(version_id, module) do
+    :ets.insert(@modules_table, {version_id, module})
   rescue
-    ArgumentError -> 0
+    ArgumentError -> :ok
   end
 
-  # --- Writes ---
-
-  def register(version_id, attrs) do
-    GenServer.call(__MODULE__, {:register, version_id, attrs})
-  end
-
-  def update(version_id, attrs) do
-    GenServer.call(__MODULE__, {:update, version_id, attrs})
+  @doc """
+  Reload a module from its stored source code.
+  Used when resuming a run — the BEAM doesn't persist compiled modules.
+  """
+  def reload_module(experiment) do
+    if experiment.code do
+      code = Loader.inject_version_id(experiment.code, experiment.version_id)
+      case Loader.load(experiment.version_id, code) do
+        {:ok, module} ->
+          cache_module(experiment.version_id, module)
+          {:ok, module}
+        {:error, reason} ->
+          Logger.warning("Failed to reload v_#{experiment.version_id}: #{inspect(reason)}")
+          {:error, reason}
+      end
+    else
+      {:error, :no_code}
+    end
   end
 
   # --- Server ---
 
   @impl true
   def init(_opts) do
-    :ets.new(@table, [:named_table, :set, :public, read_concurrency: true])
+    :ets.new(@modules_table, [:named_table, :set, :public, read_concurrency: true])
     {:ok, %{}}
-  end
-
-  @impl true
-  def handle_call({:register, version_id, attrs}, _from, state) do
-    entry = struct!(%__MODULE__{}, Map.put(attrs, :version_id, version_id))
-    :ets.insert(@table, {version_id, entry})
-    {:reply, :ok, state}
-  end
-
-  @impl true
-  def handle_call({:update, version_id, attrs}, _from, state) do
-    case :ets.lookup(@table, version_id) do
-      [{^version_id, entry}] ->
-        updated = struct!(entry, attrs)
-        :ets.insert(@table, {version_id, updated})
-        {:reply, :ok, state}
-
-      [] ->
-        {:reply, {:error, :not_found}, state}
-    end
   end
 end

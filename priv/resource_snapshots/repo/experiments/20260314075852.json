@@ -13,8 +13,33 @@
     {
       "default": "nil",
       "size": null,
+      "type": "uuid",
+      "source": "run_id",
+      "references": {
+        "name": "experiments_run_id_fkey",
+        "table": "runs",
+        "multitenancy": {
+          "global": null,
+          "strategy": null,
+          "attribute": null
+        },
+        "on_delete": null,
+        "primary_key?": true,
+        "destination_attribute": "id",
+        "deferrable": false,
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "on_update": null
+      },
+      "allow_nil?": false,
+      "generated?": false,
+      "primary_key?": false
+    },
+    {
+      "default": "nil",
+      "size": null,
       "type": "text",
-      "source": "experiment_id",
+      "source": "version_id",
       "references": null,
       "allow_nil?": false,
       "generated?": false,
@@ -25,6 +50,56 @@
       "size": null,
       "type": "text",
       "source": "status",
+      "references": null,
+      "allow_nil?": true,
+      "generated?": false,
+      "primary_key?": false
+    },
+    {
+      "default": "nil",
+      "size": null,
+      "type": "text",
+      "source": "code",
+      "references": null,
+      "allow_nil?": true,
+      "generated?": false,
+      "primary_key?": false
+    },
+    {
+      "default": "nil",
+      "size": null,
+      "type": "text",
+      "source": "description",
+      "references": null,
+      "allow_nil?": true,
+      "generated?": false,
+      "primary_key?": false
+    },
+    {
+      "default": "nil",
+      "size": null,
+      "type": "text",
+      "source": "reasoning",
+      "references": null,
+      "allow_nil?": true,
+      "generated?": false,
+      "primary_key?": false
+    },
+    {
+      "default": "nil",
+      "size": null,
+      "type": "uuid",
+      "source": "parent_id",
+      "references": null,
+      "allow_nil?": true,
+      "generated?": false,
+      "primary_key?": false
+    },
+    {
+      "default": "nil",
+      "size": null,
+      "type": "text",
+      "source": "model",
       "references": null,
       "allow_nil?": true,
       "generated?": false,
@@ -73,36 +148,6 @@
     {
       "default": "nil",
       "size": null,
-      "type": "bigint",
-      "source": "n_layer",
-      "references": null,
-      "allow_nil?": true,
-      "generated?": false,
-      "primary_key?": false
-    },
-    {
-      "default": "nil",
-      "size": null,
-      "type": "bigint",
-      "source": "n_embd",
-      "references": null,
-      "allow_nil?": true,
-      "generated?": false,
-      "primary_key?": false
-    },
-    {
-      "default": "nil",
-      "size": null,
-      "type": "text",
-      "source": "description",
-      "references": null,
-      "allow_nil?": true,
-      "generated?": false,
-      "primary_key?": false
-    },
-    {
-      "default": "nil",
-      "size": null,
       "type": "boolean",
       "source": "kept",
       "references": null,
@@ -114,7 +159,7 @@
       "default": "nil",
       "size": null,
       "type": "text",
-      "source": "reasoning",
+      "source": "error",
       "references": null,
       "allow_nil?": true,
       "generated?": false,
@@ -142,7 +187,7 @@
     }
   ],
   "table": "experiments",
-  "hash": "CAE7A63DD1B961CD2331C8DBDDEA954356D70A3261E203334832933DDC907D58",
+  "hash": "9F87EB85570FB3CA73E7D2E753159641866737351450AD37DC73420BBFF557D7",
   "repo": "Elixir.ExAutoresearch.Repo",
   "multitenancy": {
     "global": null,
