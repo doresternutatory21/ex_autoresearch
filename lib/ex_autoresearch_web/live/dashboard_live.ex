@@ -221,6 +221,8 @@ defmodule ExAutoresearchWeb.DashboardLive do
         nil
 
       {:ok, exp} ->
+        mermaid = build_mermaid(exp)
+
         %{
           version_id: exp.version_id,
           code: exp.code || "(no source)",
@@ -229,12 +231,45 @@ defmodule ExAutoresearchWeb.DashboardLive do
           description: exp.description,
           kept: exp.kept,
           status: exp.status,
-          model: exp.model
+          model: exp.model,
+          mermaid: mermaid
         }
 
       _ ->
         nil
     end
+  end
+
+  defp build_mermaid(exp) do
+    if exp.code do
+      # Try to compile the module and call build/0 to get the Axon model
+      case Registry.get_module(exp.version_id) do
+        {:ok, module} ->
+          try do
+            axon_model = module.build()
+            ExAutoresearch.Model.Display.as_mermaid(axon_model)
+          rescue
+            _ -> nil
+          end
+
+        :not_loaded ->
+          # Try to reload from stored code
+          case Registry.reload_module(exp) do
+            {:ok, module} ->
+              try do
+                axon_model = module.build()
+                ExAutoresearch.Model.Display.as_mermaid(axon_model)
+              rescue
+                _ -> nil
+              end
+
+            _ ->
+              nil
+          end
+      end
+    end
+  rescue
+    _ -> nil
   end
 
   defp push_chart(socket) do
@@ -468,10 +503,10 @@ defmodule ExAutoresearchWeb.DashboardLive do
           </div>
         </div>
 
-        <%!-- Code viewer --%>
+        <%!-- Code + Architecture viewer --%>
         <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
           <div class="flex items-center justify-between mb-3">
-            <h2 class="text-lg font-semibold text-zinc-200">📝 Trial Source Code</h2>
+            <h2 class="text-lg font-semibold text-zinc-200">📝 Trial Details</h2>
             <div class="flex items-center gap-3">
               <%= if @selected do %>
                 <span class="font-mono text-sm text-indigo-400">v_{@selected[:version_id]}</span>
@@ -500,13 +535,38 @@ defmodule ExAutoresearchWeb.DashboardLive do
             </div>
           </div>
           <%= if @selected do %>
-            <div class="text-xs text-zinc-500 mb-2 italic">{@selected[:description]}</div>
-            <div class="overflow-y-auto max-h-[24rem] bg-zinc-950 rounded-lg p-3 border border-zinc-800">
-              <pre class="text-xs font-mono text-zinc-300 whitespace-pre-wrap"><%= @selected[:code] %></pre>
+            <div class="text-xs text-zinc-500 mb-3 italic">{@selected[:description]}</div>
+            <div class="grid grid-cols-2 gap-4">
+              <%!-- Source code --%>
+              <div>
+                <h3 class="text-sm font-medium text-zinc-400 mb-2">Source Code</h3>
+                <div class="overflow-y-auto max-h-[24rem] bg-zinc-950 rounded-lg p-3 border border-zinc-800">
+                  <pre class="text-xs font-mono text-zinc-300 whitespace-pre-wrap"><%= @selected[:code] %></pre>
+                </div>
+              </div>
+              <%!-- Architecture diagram --%>
+              <div>
+                <h3 class="text-sm font-medium text-zinc-400 mb-2">Model Architecture</h3>
+                <%= if @selected[:mermaid] do %>
+                  <div
+                    id={"mermaid-#{@selected[:version_id]}"}
+                    phx-hook="Mermaid"
+                    phx-update="ignore"
+                    data-diagram={@selected[:mermaid]}
+                    class="overflow-y-auto max-h-[24rem] bg-zinc-950 rounded-lg p-3 border border-zinc-800 flex justify-center"
+                  >
+                    <div class="text-zinc-500 text-sm">Rendering...</div>
+                  </div>
+                <% else %>
+                  <div class="bg-zinc-950 rounded-lg p-3 border border-zinc-800 text-zinc-600 text-center py-8">
+                    Architecture diagram not available for this trial
+                  </div>
+                <% end %>
+              </div>
             </div>
           <% else %>
             <div class="text-zinc-600 text-center py-12">
-              Click a trial or chart data point to view source code
+              Click a trial or chart data point to view source code and architecture
             </div>
           <% end %>
         </div>

@@ -420,7 +420,11 @@ defmodule ExAutoresearch.Agent.Researcher do
   defp sanitize_loss(:neg_infinity), do: nil
 
   defp sanitize_loss(v) when is_float(v) do
-    if v != v or v == :math.exp(800), do: nil, else: v
+    cond do
+      v != v -> nil
+      abs(v) > 1.0e30 -> nil
+      true -> v
+    end
   end
 
   defp sanitize_loss(_), do: nil

@@ -45,11 +45,59 @@ const Chart = {
   }
 }
 
+// Mermaid hook — loads mermaid from CDN on first use, renders diagrams
+const Mermaid = {
+  mounted() {
+    this.renderDiagram()
+  },
+  updated() {
+    this.renderDiagram()
+  },
+  async renderDiagram() {
+    const diagram = this.el.dataset.diagram
+    if (!diagram) return
+
+    // Lazy-load mermaid from CDN
+    if (!window.mermaid) {
+      const script = document.createElement('script')
+      script.src = 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js'
+      script.onload = () => {
+        window.mermaid.initialize({
+          startOnLoad: false,
+          theme: 'dark',
+          themeVariables: {
+            primaryColor: '#818cf8',
+            primaryTextColor: '#e4e4e7',
+            primaryBorderColor: '#3f3f46',
+            lineColor: '#71717a',
+            secondaryColor: '#27272a',
+            tertiaryColor: '#18181b',
+            fontSize: '12px'
+          }
+        })
+        this.doRender(diagram)
+      }
+      document.head.appendChild(script)
+    } else {
+      this.doRender(diagram)
+    }
+  },
+  async doRender(diagram) {
+    try {
+      const id = 'mermaid-render-' + Math.random().toString(36).slice(2)
+      const { svg } = await window.mermaid.render(id, diagram)
+      this.el.innerHTML = svg
+    } catch(e) {
+      this.el.innerHTML = '<div class="text-red-400 text-xs p-2">Diagram render failed: ' + e.message + '</div>'
+    }
+  }
+}
+
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, Chart},
+  hooks: {...colocatedHooks, Chart, Mermaid},
 })
 
 // Show progress bar on live navigation and form submits
