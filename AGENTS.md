@@ -5,6 +5,32 @@ This is a web application written using the Phoenix web framework.
 - Use `mix precommit` alias when you are done with all changes and fix any pending issues
 - Use the already included and available `:req` (`Req`) library for HTTP requests, **avoid** `:httpoison`, `:tesla`, and `:httpc`. Req is included by default and is the preferred HTTP client for Phoenix apps
 
+### Ash guidelines
+
+- This project uses **Ash Framework** with **AshSqlite** for persistence
+- After ANY change to Ash resources (attributes, actions, relationships, identities), you **MUST** run:
+  ```bash
+  mix ash.codegen <short_description> --yes
+  ```
+  This generates migration files and resource snapshots. Without it, the app shows a `PendingCodegen` error at runtime.
+- After generating codegen, run migrations:
+  ```bash
+  mix ash_sqlite.migrate
+  ```
+  Or via RPC on a running node:
+  ```elixir
+  Ecto.Migrator.run(ExAutoresearch.Repo, :up, all: true)
+  ```
+- **Never** write Ecto migrations manually for Ash-managed tables. Always use `mix ash.codegen`.
+- Ash resources live in `lib/ex_autoresearch/research/` (domain: `ExAutoresearch.Research`)
+- Key resources: `Campaign` (research sessions) and `Trial` (individual experiments)
+- Use `primary? true` on the main create action for each resource
+- **After codegen, always migrate before starting the app.** The full sequence after Ash resource changes is:
+  1. `mix ash.codegen <description> --yes`
+  2. `mix ash_sqlite.migrate` (or `mix ecto.migrate`)
+  3. Then start/restart the app
+  If you forget step 2, Phoenix will show `PendingMigrationError` at runtime.
+
 ### Phoenix v1.8 guidelines
 
 - **Always** begin your LiveView templates with `<Layouts.app flash={@flash} ...>` which wraps all inner content
