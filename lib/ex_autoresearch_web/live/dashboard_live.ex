@@ -350,7 +350,7 @@ defmodule ExAutoresearchWeb.DashboardLive do
               <option value="claude" selected={@current_backend == :claude}>Claude</option>
               <option value="gemini" selected={@current_backend == :gemini}>Gemini</option>
             </select>
-            <select phx-change="change_model" name="model"
+            <select phx-change="change_model" name="model" id={"model-select-#{@current_backend}"}
               class="bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-2 py-1.5 focus:ring-indigo-500 focus:border-indigo-500">
               <%= for {id, label} <- @backend_models do %>
                 <option value={id} selected={id == @current_model}><%= label %></option>
