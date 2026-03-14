@@ -33,9 +33,11 @@ defmodule ExAutoresearch.Research.Campaign do
     uuid_v7_primary_key :id
 
     attribute :tag, :string, allow_nil?: false
+
     attribute :status, :atom,
       constraints: [one_of: [:running, :paused, :completed]],
       default: :running
+
     attribute :model, :string, default: "claude-sonnet-4"
     attribute :time_budget, :integer, default: 15
     attribute :base_config, :map

@@ -27,9 +27,7 @@ defmodule ExAutoresearch.Cluster.Network do
   end
 
   defp detect_ip do
-    case System.cmd("ip", ["-4", "-o", "addr", "show", "scope", "global"],
-           stderr_to_stdout: true
-         ) do
+    case System.cmd("ip", ["-4", "-o", "addr", "show", "scope", "global"], stderr_to_stdout: true) do
       {output, 0} ->
         lines = String.split(output, "\n", trim: true)
 

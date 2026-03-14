@@ -21,7 +21,7 @@ defmodule ExAutoresearch.Training.Scheduler do
         progress / config.warmup_ratio
 
       # Warmdown phase: linear decay from 1 to final_lr_frac
-      config.warmdown_ratio > 0 and progress > (1.0 - config.warmdown_ratio) ->
+      config.warmdown_ratio > 0 and progress > 1.0 - config.warmdown_ratio ->
         warmdown_progress = (progress - (1.0 - config.warmdown_ratio)) / config.warmdown_ratio
         1.0 - warmdown_progress * (1.0 - config.final_lr_frac)
 

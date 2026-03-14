@@ -64,13 +64,14 @@ defmodule ExAutoresearch.Agent.Program do
   end
 
   def format_results(experiments) do
-    header = "# Experiment History\n\n| # | Loss | Steps | Time | Config Changes | Status |\n|---|------|-------|------|---------------|--------|\n"
+    header =
+      "# Experiment History\n\n| # | Loss | Steps | Time | Config Changes | Status |\n|---|------|-------|------|---------------|--------|\n"
 
     rows =
       experiments
       |> Enum.with_index(1)
       |> Enum.map(fn {exp, i} ->
-        loss = exp[:final_loss] && Float.round(exp[:final_loss], 6) || "crash"
+        loss = (exp[:final_loss] && Float.round(exp[:final_loss], 6)) || "crash"
         steps = exp[:num_steps] || 0
         time = exp[:training_seconds] || 0
         desc = exp[:description] || ""

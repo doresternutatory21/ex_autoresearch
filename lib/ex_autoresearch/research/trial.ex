@@ -21,6 +21,7 @@ defmodule ExAutoresearch.Research.Trial do
 
     create :record do
       primary? true
+
       accept [
         :campaign_id,
         :version_id,
@@ -49,9 +50,11 @@ defmodule ExAutoresearch.Research.Trial do
 
     attribute :campaign_id, :uuid_v7, allow_nil?: false
     attribute :version_id, :string, allow_nil?: false
+
     attribute :status, :atom,
       constraints: [one_of: [:pending, :running, :completed, :crashed, :discarded]],
       default: :pending
+
     attribute :code, :string, allow_nil?: true
     attribute :description, :string
     attribute :reasoning, :string

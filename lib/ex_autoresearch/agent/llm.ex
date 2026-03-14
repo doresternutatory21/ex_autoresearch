@@ -1,54 +1,77 @@
 defmodule ExAutoresearch.Agent.LLM do
   @moduledoc """
-  LLM backend using jido_ghcopilot Server protocol.
+  Pluggable LLM backend manager.
 
-  Maintains a persistent Copilot CLI connection with session management.
-  Text is accumulated from streaming chunks until the turn completes.
+  Delegates to backend modules that implement the LLM.Backend behaviour.
+  The active backend can be switched at runtime via `set_backend/2`.
+
+  Supported backends:
+  - `:copilot` — GitHub Copilot via jido_ghcopilot Server protocol
+  - `:claude` — Anthropic Claude via jido_claude
+  - `:gemini` — Google Gemini via jido_gemini
+
+  Each backend+model combination is a separate GenServer connection.
+  Switching is instant — the next prompt goes to the new backend.
   """
 
   use GenServer
 
   require Logger
 
-  alias Jido.GHCopilot.Server.Connection
-
-  @default_model "claude-sonnet-4"
-
-  defstruct [:conn, :session_id, :model, status: :disconnected, buffer: "", caller: nil]
+  alias ExAutoresearch.Agent.LLM.CopilotBackend
 
   @prompt_schema NimbleOptions.new!(
-                   system: [type: :string, doc: "System prompt (prepended to the user prompt)"],
-                   model: [type: :string, doc: "Override the session model"]
+                   system: [type: :string, doc: "System prompt prepended to user prompt"],
+                   model: [type: :string, doc: "Model override for this prompt"]
                  )
+
+  @type backend :: :copilot | :claude | :gemini
+  @type backend_state :: %{
+          backend: backend(),
+          model: String.t(),
+          pid: pid() | nil,
+          status: :connecting | :idle | :error
+        }
+
+  defstruct [:active, backends: %{}]
+
+  # --- Client API ---
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
   @doc """
-  Send a prompt and wait for the complete response.
+  Send a prompt and wait for the complete text response.
 
   ## Options
-
   #{NimbleOptions.docs(@prompt_schema)}
   """
   @spec prompt(String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
   def prompt(text, opts \\ []) do
     opts = NimbleOptions.validate!(opts, @prompt_schema)
-    system = opts[:system]
-    model = opts[:model]
+    system = Keyword.get(opts, :system)
+    model = Keyword.get(opts, :model)
 
-    full_prompt =
-      if system do
-        "#{system}\n\n---\n\n#{text}"
-      else
-        text
-      end
+    full_prompt = if system, do: "#{system}\n\n---\n\n#{text}", else: text
 
     GenServer.call(__MODULE__, {:prompt, full_prompt, model}, :infinity)
   end
 
-  @doc "Check if the connection is alive."
+  @doc "Switch to a different backend and model. Takes effect on next prompt."
+  @spec set_backend(backend(), String.t()) :: :ok
+  def set_backend(backend, model) when backend in [:copilot, :claude, :gemini] do
+    GenServer.call(__MODULE__, {:set_backend, backend, model})
+  end
+
+  @doc "Get current backend and model."
+  @spec current() :: {backend(), String.t()}
+  def current do
+    GenServer.call(__MODULE__, :current)
+  end
+
+  @doc "Check if any backend is connected."
+  @spec available?() :: boolean()
   def available? do
     case GenServer.whereis(__MODULE__) do
       nil -> false
@@ -56,142 +79,150 @@ defmodule ExAutoresearch.Agent.LLM do
     end
   end
 
-  # Server
+  @doc "List all available backends with their connection status."
+  @spec backends() :: [{backend(), String.t(), :idle | :connecting | :error | :not_started}]
+  def backends do
+    GenServer.call(__MODULE__, :list_backends)
+  end
+
+  # --- Server ---
 
   @impl true
   def init(opts) do
-    model = Keyword.get(opts, :model, @default_model)
-    state = %__MODULE__{model: model}
-    {:ok, state, {:continue, :connect}}
+    backend = Keyword.get(opts, :backend, :copilot)
+    model = Keyword.get(opts, :model, "claude-sonnet-4")
+
+    state = %__MODULE__{
+      active: {backend, model},
+      backends: %{}
+    }
+
+    # Start the default backend
+    {:ok, state, {:continue, {:ensure_backend, backend, model}}}
   end
 
   @impl true
-  def handle_continue(:connect, state) do
-    cli_args = ["--allow-all-tools", "--allow-all-paths", "--allow-all-urls"]
+  def handle_continue({:ensure_backend, backend, model}, state) do
+    state = ensure_backend_started(state, backend, model)
+    {:noreply, state}
+  end
 
-    case Connection.start_link(cli_args: cli_args, cwd: File.cwd!()) do
-      {:ok, conn} ->
-        case Connection.create_session(conn, %{model: state.model}) do
-          {:ok, session_id} ->
-            :ok = Connection.subscribe(conn, session_id)
-            Logger.info("LLM connected: model=#{state.model}, session=#{session_id}")
-            {:noreply, %{state | conn: conn, session_id: session_id, status: :idle}}
+  @impl true
+  def handle_call({:prompt, text, model_override}, from, state) do
+    {backend, default_model} = state.active
+    model = model_override || default_model
 
-          {:error, reason} ->
-            Logger.error("LLM session creation failed: #{inspect(reason)}")
-            Process.send_after(self(), :reconnect, 5_000)
-            {:noreply, %{state | conn: conn, status: :error}}
-        end
+    # Ensure this backend+model is started
+    state = ensure_backend_started(state, backend, model)
 
-      {:error, reason} ->
-        Logger.error("LLM connection failed: #{inspect(reason)}")
-        Process.send_after(self(), :reconnect, 5_000)
-        {:noreply, %{state | status: :error}}
+    case get_backend_pid(state, backend) do
+      {:ok, pid} ->
+        # Delegate to the backend GenServer
+        Task.start(fn ->
+          result = GenServer.call(pid, {:prompt, text, model}, :infinity)
+          GenServer.reply(from, result)
+        end)
+
+        {:noreply, state}
+
+      :error ->
+        {:reply, {:error, {:backend_not_available, backend}}, state}
     end
   end
 
   @impl true
-  def handle_call({:prompt, text, requested_model}, from, %{status: :idle} = state) do
-    # Switch model if different from current
-    state =
-      if requested_model && requested_model != state.model do
-        case switch_model(state, requested_model) do
-          {:ok, new_state} ->
-            Logger.info("LLM switched to model: #{requested_model}")
-            new_state
+  def handle_call({:set_backend, backend, model}, _from, state) do
+    Logger.info("LLM backend → #{backend}:#{model}")
+    state = %{state | active: {backend, model}}
+    state = ensure_backend_started(state, backend, model)
+    {:reply, :ok, state}
+  end
 
-          {:error, reason} ->
-            Logger.warning("Model switch failed: #{inspect(reason)}, using #{state.model}")
-            state
-        end
-      else
+  @impl true
+  def handle_call(:current, _from, state) do
+    {:reply, state.active, state}
+  end
+
+  @impl true
+  def handle_call(:list_backends, _from, state) do
+    {active_backend, _} = state.active
+
+    list =
+      [:copilot, :claude, :gemini]
+      |> Enum.map(fn b ->
+        status =
+          case Map.get(state.backends, b) do
+            %{status: s} -> s
+            nil -> :not_started
+          end
+
+        {b, b == active_backend, status}
+      end)
+
+    {:reply, list, state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, _ref, :process, pid, reason}, state) do
+    # A backend process died — mark it as error
+    {backend, _} =
+      Enum.find(state.backends, {nil, nil}, fn {_k, v} -> v.pid == pid end) || {nil, nil}
+
+    if backend do
+      Logger.warning("LLM backend #{backend} died: #{inspect(reason, limit: 3)}")
+
+      state =
+        put_in(state.backends[backend], %{state.backends[backend] | pid: nil, status: :error})
+
+      {:noreply, state}
+    else
+      {:noreply, state}
+    end
+  end
+
+  @impl true
+  def handle_info(_, state), do: {:noreply, state}
+
+  # --- Private ---
+
+  defp ensure_backend_started(state, backend, model) do
+    case Map.get(state.backends, backend) do
+      %{pid: pid, status: :idle} when is_pid(pid) ->
         state
-      end
-
-    Logger.debug("LLM prompt (#{String.length(text)} chars, model: #{state.model})")
-
-    case Connection.send_prompt(state.conn, state.session_id, text) do
-      {:ok, _msg_id} ->
-        {:noreply, %{state | status: :waiting, buffer: "", caller: from}}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
-  end
-
-  def handle_call({:prompt, _text, _model}, _from, state) do
-    {:reply, {:error, {:not_ready, state.status}}, state}
-  end
-
-  # Streaming events from Copilot
-
-  @impl true
-  def handle_info({:server_event, %{type: type, data: data}}, %{caller: from} = state) do
-    case type do
-      # Server protocol sends full message, not chunks
-      "assistant.message" ->
-        content = data["content"] || ""
-        Logger.debug("LLM message: #{String.length(content)} chars")
-        {:noreply, %{state | buffer: state.buffer <> content}}
-
-      # Also handle chunk-based protocols (ACP mode)
-      "assistant.message.chunk" ->
-        chunk = data["chunkContent"] || data["content"] || ""
-        {:noreply, %{state | buffer: state.buffer <> chunk}}
-
-      "session.idle" when not is_nil(from) ->
-        response = String.trim(state.buffer)
-        Logger.debug("LLM turn complete: #{String.length(response)} chars")
-        GenServer.reply(from, {:ok, response})
-        {:noreply, %{state | status: :idle, buffer: "", caller: nil}}
 
       _ ->
-        {:noreply, state}
+        case start_backend(backend, model) do
+          {:ok, pid} ->
+            Process.monitor(pid)
+            put_in(state.backends[backend], %{pid: pid, model: model, status: :idle})
+
+          {:error, reason} ->
+            Logger.error("Failed to start #{backend} backend: #{inspect(reason)}")
+            put_in(state.backends[backend], %{pid: nil, model: model, status: :error})
+        end
     end
   end
 
-  def handle_info({:server_event, _event}, state) do
-    {:noreply, state}
+  defp start_backend(:copilot, model) do
+    CopilotBackend.start_link(model: model)
   end
 
-  # Deny any tool calls — we only want text output
-  def handle_info({:server_tool_call, tool_call}, state) do
-    Logger.debug("LLM tool call denied: #{tool_call.tool_name}")
-
-    Connection.respond_to_tool_call(state.conn, tool_call.request_id, %{
-      "error" => "No tools available. Output code as text in your response."
-    })
-
-    {:noreply, state}
+  defp start_backend(:claude, model) do
+    # TODO: implement when jido_claude is wired up
+    Logger.warning("Claude backend not yet implemented")
+    {:error, :not_implemented}
   end
 
-  def handle_info(:reconnect, state) do
-    Logger.info("LLM reconnecting...")
-    {:noreply, state, {:continue, :connect}}
+  defp start_backend(:gemini, model) do
+    # TODO: implement when jido_gemini is wired up
+    Logger.warning("Gemini backend not yet implemented")
+    {:error, :not_implemented}
   end
 
-  def handle_info(_msg, state), do: {:noreply, state}
-
-  @impl true
-  def terminate(_reason, %{conn: conn}) when not is_nil(conn) do
-    Connection.stop(conn)
-  end
-
-  def terminate(_, _), do: :ok
-
-  # Create a new session with a different model on the same connection
-  defp switch_model(%{conn: conn, session_id: old_sid} = state, new_model) do
-    if old_sid, do: Connection.unsubscribe(conn, old_sid)
-
-    case Connection.create_session(conn, %{model: new_model}) do
-      {:ok, new_sid} ->
-        :ok = Connection.subscribe(conn, new_sid)
-        {:ok, %{state | session_id: new_sid, model: new_model}}
-
-      {:error, reason} ->
-        # Re-subscribe to old session on failure
-        if old_sid, do: Connection.subscribe(conn, old_sid)
-        {:error, reason}
+  defp get_backend_pid(state, backend) do
+    case Map.get(state.backends, backend) do
+      %{pid: pid} when is_pid(pid) -> {:ok, pid}
+      _ -> :error
     end
   end
 end

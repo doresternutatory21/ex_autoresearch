@@ -42,9 +42,11 @@ defmodule ExAutoresearch.Data.Loader do
       # Generate patterned sequences the model can learn
       # Pattern: incrementing tokens with wrapping
       base = :rand.uniform(vocab_size) - 1
-      input = Nx.iota({batch_size, seq_len}, type: :s64)
-             |> Nx.add(base)
-             |> Nx.remainder(vocab_size)
+
+      input =
+        Nx.iota({batch_size, seq_len}, type: :s64)
+        |> Nx.add(base)
+        |> Nx.remainder(vocab_size)
 
       targets = Nx.add(input, 1) |> Nx.remainder(vocab_size)
 

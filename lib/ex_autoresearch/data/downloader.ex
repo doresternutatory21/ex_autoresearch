@@ -31,13 +31,21 @@ defmodule ExAutoresearch.Data.Downloader do
     Logger.info("Downloading #{length(shard_indices)} shards to #{dir}")
 
     shard_indices
-    |> Task.async_stream(&download_shard(&1, dir), max_concurrency: concurrency, timeout: :infinity)
+    |> Task.async_stream(&download_shard(&1, dir),
+      max_concurrency: concurrency,
+      timeout: :infinity
+    )
     |> Enum.reduce({0, 0}, fn
-      {:ok, :ok}, {ok, err} -> {ok + 1, err}
-      {:ok, :exists}, {ok, err} -> {ok + 1, err}
+      {:ok, :ok}, {ok, err} ->
+        {ok + 1, err}
+
+      {:ok, :exists}, {ok, err} ->
+        {ok + 1, err}
+
       {:ok, {:error, reason}}, {ok, err} ->
         Logger.error("Shard download failed: #{inspect(reason)}")
         {ok, err + 1}
+
       {:exit, reason}, {ok, err} ->
         Logger.error("Shard download crashed: #{inspect(reason)}")
         {ok, err + 1}

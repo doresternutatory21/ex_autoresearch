@@ -113,8 +113,7 @@ defmodule ExAutoresearch.Cluster do
       nodes
       |> Enum.sort_by(fn n ->
         # Prefer: discrete GPU > iGPU, then by VRAM, then by RAM
-        {if(has_gpu?(n.capabilities), do: 0, else: 1),
-         -Map.get(n.capabilities, "vram_mb", 0),
+        {if(has_gpu?(n.capabilities), do: 0, else: 1), -Map.get(n.capabilities, "vram_mb", 0),
          -Map.get(n.capabilities, "memory_gb", 0)}
       end)
       |> List.first()
@@ -226,7 +225,11 @@ defmodule ExAutoresearch.Cluster do
            stderr_to_stdout: true
          ) do
       {output, 0} ->
-        output |> String.trim() |> String.split("\n") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+        output
+        |> String.trim()
+        |> String.split("\n")
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
 
       _ ->
         []

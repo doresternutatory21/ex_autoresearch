@@ -17,7 +17,7 @@ defmodule ExAutoresearchWeb.DashboardLive do
     selected =
       if agent.best_version, do: load_version(agent.best_version), else: nil
 
-    models = Jido.GHCopilot.Models.all()
+    models = build_model_options()
 
     socket =
       socket
@@ -31,7 +31,7 @@ defmodule ExAutoresearchWeb.DashboardLive do
       |> assign(:agent_log, [])
       |> assign(:selected, selected)
       |> assign(:models, models)
-      |> assign(:current_model, agent.model || "claude-sonnet-4")
+      |> assign(:current_model, "copilot:#{agent.model || "claude-sonnet-4"}")
       |> assign(:chart_trials, trials)
       |> stream(:trials, trials, at: 0)
 
@@ -42,7 +42,8 @@ defmodule ExAutoresearchWeb.DashboardLive do
 
   @impl true
   def handle_event("start_research", _params, socket) do
-    Researcher.start_research(tag: socket.assigns.campaign_tag, model: socket.assigns.current_model)
+    {_backend, model} = parse_backend_model(socket.assigns.current_model)
+    Researcher.start_research(tag: socket.assigns.campaign_tag, model: model)
     {:noreply, assign(socket, :agent_status, :running)}
   end
 
@@ -60,13 +61,19 @@ defmodule ExAutoresearchWeb.DashboardLive do
   @impl true
   def handle_event("select_best", _params, socket) do
     agent = Researcher.status()
-    {:noreply, assign(socket, :selected, if(agent.best_version, do: load_version(agent.best_version)))}
+
+    {:noreply,
+     assign(socket, :selected, if(agent.best_version, do: load_version(agent.best_version)))}
   end
 
   @impl true
   def handle_event("change_model", %{"model" => model_id}, socket) do
-    Researcher.set_model(model_id)
-    {:noreply, socket |> assign(:current_model, model_id) |> add_log("🔄 Model → #{model_id}")}
+    # Parse "backend:model" format (e.g. "copilot:claude-opus-4.6")
+    {backend, model} = parse_backend_model(model_id)
+    ExAutoresearch.Agent.LLM.set_backend(backend, model)
+    Researcher.set_model(model)
+    short = "#{backend}:#{String.replace(model, "claude-", "")}"
+    {:noreply, socket |> assign(:current_model, model_id) |> add_log("🔄 #{short}")}
   end
 
   # --- PubSub ---
@@ -109,26 +116,31 @@ defmodule ExAutoresearchWeb.DashboardLive do
       |> assign(:chart_trials, chart_trials)
       |> add_log("#{tag} v_#{r[:version_id]} loss=#{safe_fmt(r[:loss])} — #{r[:description]}")
 
-    socket = if r[:kept], do: assign(socket, :selected, load_version(r[:version_id])), else: socket
+    socket =
+      if r[:kept], do: assign(socket, :selected, load_version(r[:version_id])), else: socket
 
     {:noreply, push_chart(socket)}
   end
 
   @impl true
   def handle_info({:step, p}, socket) do
-    {:noreply, socket |> assign(:current_step, p[:step]) |> assign(:current_progress, p[:progress])}
+    {:noreply,
+     socket |> assign(:current_step, p[:step]) |> assign(:current_progress, p[:progress])}
   end
 
   @impl true
   def handle_info({:agent_thinking, _}, socket), do: {:noreply, add_log(socket, "🤔 Thinking...")}
   @impl true
-  def handle_info({:agent_responded, p}, socket), do: {:noreply, add_log(socket, "💡 #{p[:reasoning] || "..."}")}
+  def handle_info({:agent_responded, p}, socket),
+    do: {:noreply, add_log(socket, "💡 #{p[:reasoning] || "..."}")}
+
   @impl true
   def handle_info({:status_changed, p}, socket) do
     socket = assign(socket, :agent_status, p[:status])
     socket = if p[:model], do: assign(socket, :current_model, p[:model]), else: socket
     {:noreply, socket}
   end
+
   @impl true
   def handle_info(_, socket), do: {:noreply, socket}
 
@@ -147,50 +159,94 @@ defmodule ExAutoresearchWeb.DashboardLive do
 
   defp trial_to_map(%ExAutoresearch.Research.Trial{} = exp) do
     # From Ash struct (SQLite)
-    %{id: exp.version_id, version_id: exp.version_id, loss: exp.final_loss,
-      steps: exp.num_steps, training_seconds: exp.training_seconds,
-      description: exp.description, kept: exp.kept, status: exp.status,
-      model: exp.model, timestamp: exp.inserted_at}
+    %{
+      id: exp.version_id,
+      version_id: exp.version_id,
+      loss: exp.final_loss,
+      steps: exp.num_steps,
+      training_seconds: exp.training_seconds,
+      description: exp.description,
+      kept: exp.kept,
+      status: exp.status,
+      model: exp.model,
+      timestamp: exp.inserted_at
+    }
   end
+
   defp trial_to_map(r) when is_map(r) do
     # From PubSub event (plain map with :loss/:steps keys)
-    %{id: r[:version_id], version_id: r[:version_id], loss: r[:loss],
-      steps: r[:steps], training_seconds: r[:training_seconds],
-      description: r[:description], kept: r[:kept], status: r[:status],
-      model: r[:model], timestamp: DateTime.utc_now()}
+    %{
+      id: r[:version_id],
+      version_id: r[:version_id],
+      loss: r[:loss],
+      steps: r[:steps],
+      training_seconds: r[:training_seconds],
+      description: r[:description],
+      kept: r[:kept],
+      status: r[:status],
+      model: r[:model],
+      timestamp: DateTime.utc_now()
+    }
   end
 
   defp load_version(vid) do
     case Registry.get_trial(vid) do
-      {:ok, nil} -> nil
-      {:ok, exp} -> %{version_id: exp.version_id, code: exp.code || "(no source)",
-                       loss: exp.final_loss, steps: exp.num_steps, description: exp.description,
-                       kept: exp.kept, status: exp.status, model: exp.model}
-      _ -> nil
+      {:ok, nil} ->
+        nil
+
+      {:ok, exp} ->
+        %{
+          version_id: exp.version_id,
+          code: exp.code || "(no source)",
+          loss: exp.final_loss,
+          steps: exp.num_steps,
+          description: exp.description,
+          kept: exp.kept,
+          status: exp.status,
+          model: exp.model
+        }
+
+      _ ->
+        nil
     end
   end
 
   defp push_chart(socket) do
-    trials = socket.assigns.chart_trials
+    trials =
+      socket.assigns.chart_trials
       |> Enum.reverse()
       |> Enum.filter(& &1[:loss])
 
-    data = Enum.with_index(trials)
+    data =
+      Enum.with_index(trials)
       |> Enum.map(fn {t, i} ->
-        %{value: [i, t[:loss]], version_id: t[:version_id],
-          itemStyle: if(t[:kept], do: %{color: "#34d399"}, else: %{color: "#ef4444"})}
+        %{
+          value: [i, t[:loss]],
+          version_id: t[:version_id],
+          itemStyle: if(t[:kept], do: %{color: "#34d399"}, else: %{color: "#ef4444"})
+        }
       end)
 
     chart_option = %{
       backgroundColor: "transparent",
       tooltip: %{trigger: "item", formatter: "{c}"},
       xAxis: %{type: "value", name: "Trial #", nameLocation: "center", nameGap: 25},
-      yAxis: %{type: "value", name: "Loss", nameLocation: "center", nameGap: 45,
-               min: 0, axisLabel: %{formatter: "{value}"}},
-      series: [%{
-        type: "scatter", symbolSize: 8, data: data,
-        emphasis: %{itemStyle: %{borderColor: "#818cf8", borderWidth: 2}}
-      }]
+      yAxis: %{
+        type: "value",
+        name: "Loss",
+        nameLocation: "center",
+        nameGap: 45,
+        min: 0,
+        axisLabel: %{formatter: "{value}"}
+      },
+      series: [
+        %{
+          type: "scatter",
+          symbolSize: 8,
+          data: data,
+          emphasis: %{itemStyle: %{borderColor: "#818cf8", borderWidth: 2}}
+        }
+      ]
     }
 
     push_event(socket, "chart-data-loss-chart", chart_option)
@@ -201,11 +257,38 @@ defmodule ExAutoresearchWeb.DashboardLive do
   defp safe_fmt(l), do: to_string(l)
 
   defp short_model(nil), do: "-"
-  defp short_model(m), do: m |> String.replace("claude-", "") |> String.replace("gpt-", "gpt") |> String.replace("-preview", "")
+
+  defp short_model(m),
+    do:
+      m
+      |> String.replace("claude-", "")
+      |> String.replace("gpt-", "gpt")
+      |> String.replace("-preview", "")
 
   defp fmt_time(nil), do: ""
   defp fmt_time(%DateTime{} = dt), do: Calendar.strftime(dt, "%H:%M:%S")
   defp fmt_time(_), do: ""
+
+  defp parse_backend_model(combined) do
+    case String.split(combined, ":", parts: 2) do
+      [backend, model] -> {String.to_existing_atom(backend), model}
+      [model] -> {:copilot, model}
+    end
+  rescue
+    _ -> {:copilot, combined}
+  end
+
+  defp build_model_options do
+    copilot_models =
+      Jido.GHCopilot.Models.all()
+      |> Enum.map(fn {name, id, mult} ->
+        label = "Copilot: #{name}#{if mult > 1, do: " (#{mult}x)", else: ""}"
+        {"copilot:#{id}", label}
+      end)
+
+    # Claude and Gemini placeholders — will be populated when backends are wired up
+    copilot_models
+  end
 
   # --- Render ---
 
@@ -226,11 +309,14 @@ defmodule ExAutoresearchWeb.DashboardLive do
             </p>
           </div>
           <div class="flex items-center gap-3">
-            <select phx-change="change_model" name="model"
-              class="bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-3 py-1.5 focus:ring-indigo-500 focus:border-indigo-500">
-              <%= for {name, id, mult} <- @models do %>
+            <select
+              phx-change="change_model"
+              name="model"
+              class="bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-3 py-1.5 focus:ring-indigo-500 focus:border-indigo-500"
+            >
+              <%= for {id, label} <- @models do %>
                 <option value={id} selected={id == @current_model}>
-                  <%= name %><%= if mult > 1, do: " (#{mult}x)", else: "" %>
+                  {label}
                 </option>
               <% end %>
             </select>
@@ -238,9 +324,19 @@ defmodule ExAutoresearchWeb.DashboardLive do
               {@agent_status}
             </span>
             <%= if @agent_status in [:idle, :stopping, :paused] do %>
-              <button phx-click="start_research" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-sm font-medium transition">▶ Start</button>
+              <button
+                phx-click="start_research"
+                class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-sm font-medium transition"
+              >
+                ▶ Start
+              </button>
             <% else %>
-              <button phx-click="stop_research" class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-sm font-medium transition">⏹ Stop</button>
+              <button
+                phx-click="stop_research"
+                class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-sm font-medium transition"
+              >
+                ⏹ Stop
+              </button>
             <% end %>
           </div>
         </div>
@@ -249,15 +345,16 @@ defmodule ExAutoresearchWeb.DashboardLive do
         <div class="grid grid-cols-5 gap-4">
           <.stat label="Trials" value={@trial_count} />
           <.stat label="Best Loss" value={safe_fmt(@best_loss)} />
-          <.stat label="Best Trial" value={@best_version && "v_#{@best_version}" || "-"} />
+          <.stat label="Best Trial" value={(@best_version && "v_#{@best_version}") || "-"} />
           <.stat label="Current Step" value={@current_step || "-"} />
-          <.stat label="Progress" value={@current_progress && "#{@current_progress}%" || "-"} />
+          <.stat label="Progress" value={(@current_progress && "#{@current_progress}%") || "-"} />
         </div>
 
         <%!-- Chart --%>
         <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
           <h2 class="text-lg font-semibold text-zinc-200 mb-2">📈 Loss over Trials</h2>
-          <div id="loss-chart" phx-hook="Chart" phx-update="ignore" style="width:100%; height:250px;"></div>
+          <div id="loss-chart" phx-hook="Chart" phx-update="ignore" style="width:100%; height:250px;">
+          </div>
         </div>
 
         <%!-- Trials + Agent log --%>
@@ -277,17 +374,28 @@ defmodule ExAutoresearchWeb.DashboardLive do
                   </tr>
                 </thead>
                 <tbody id="trials" phx-update="stream">
-                  <tr :for={{dom_id, t} <- @streams.trials} id={dom_id}
-                    phx-click="select_version" phx-value-version={t[:version_id]}
+                  <tr
+                    :for={{dom_id, t} <- @streams.trials}
+                    id={dom_id}
+                    phx-click="select_version"
+                    phx-value-version={t[:version_id]}
                     class={[
                       "border-b border-zinc-800/50 cursor-pointer transition hover:bg-zinc-800/40",
                       t[:kept] && "bg-emerald-950/20",
-                      @selected && @selected[:version_id] == t[:version_id] && "ring-1 ring-indigo-500 bg-indigo-950/20"
-                    ]}>
-                    <td class="py-1.5 px-2 text-xs text-zinc-500 font-mono">{fmt_time(t[:timestamp])}</td>
+                      @selected && @selected[:version_id] == t[:version_id] &&
+                        "ring-1 ring-indigo-500 bg-indigo-950/20"
+                    ]}
+                  >
+                    <td class="py-1.5 px-2 text-xs text-zinc-500 font-mono">
+                      {fmt_time(t[:timestamp])}
+                    </td>
                     <td class="py-1.5 px-2">
-                      <div class="font-mono text-xs text-zinc-400">{"v_#{t[:version_id] || "?"}"}</div>
-                      <div class="text-xs text-zinc-500 truncate max-w-[12rem]">{t[:description] || ""}</div>
+                      <div class="font-mono text-xs text-zinc-400">
+                        {"v_#{t[:version_id] || "?"}"}
+                      </div>
+                      <div class="text-xs text-zinc-500 truncate max-w-[12rem]">
+                        {t[:description] || ""}
+                      </div>
                     </td>
                     <td class="py-1.5 px-2 font-mono text-zinc-300 text-sm">{safe_fmt(t[:loss])}</td>
                     <td class="py-1.5 px-2 text-right text-zinc-500 text-xs">{t[:steps] || "-"}</td>
@@ -298,7 +406,9 @@ defmodule ExAutoresearchWeb.DashboardLive do
                   </tr>
                 </tbody>
               </table>
-              <div class="hidden only:block text-zinc-600 text-center py-8">No trials yet. Hit ▶ Start.</div>
+              <div class="hidden only:block text-zinc-600 text-center py-8">
+                No trials yet. Hit ▶ Start.
+              </div>
             </div>
           </div>
 
@@ -308,7 +418,12 @@ defmodule ExAutoresearchWeb.DashboardLive do
               <%= if @agent_log == [] do %>
                 <p class="text-zinc-600 text-center py-8">Waiting for agent activity...</p>
               <% else %>
-                <div :for={entry <- @agent_log} class="text-xs font-mono text-zinc-400 py-0.5 leading-relaxed">{entry}</div>
+                <div
+                  :for={entry <- @agent_log}
+                  class="text-xs font-mono text-zinc-400 py-0.5 leading-relaxed"
+                >
+                  {entry}
+                </div>
               <% end %>
             </div>
           </div>
@@ -325,13 +440,23 @@ defmodule ExAutoresearchWeb.DashboardLive do
                 <span class="text-xs text-zinc-500">{short_model(@selected[:model])}</span>
                 <span class={[
                   "text-xs px-1.5 py-0.5 rounded",
-                  if(@selected[:kept], do: "bg-emerald-900/50 text-emerald-400", else: "bg-zinc-800 text-zinc-500")
+                  if(@selected[:kept],
+                    do: "bg-emerald-900/50 text-emerald-400",
+                    else: "bg-zinc-800 text-zinc-500"
+                  )
                 ]}>
-                  {if @selected[:kept], do: "kept", else: if(@selected[:status] == :crashed, do: "crashed", else: "discarded")}
+                  {if @selected[:kept],
+                    do: "kept",
+                    else: if(@selected[:status] == :crashed, do: "crashed", else: "discarded")}
                 </span>
               <% end %>
               <%= if @best_version do %>
-                <button phx-click="select_best" class="text-xs px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 transition">Show Best</button>
+                <button
+                  phx-click="select_best"
+                  class="text-xs px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 transition"
+                >
+                  Show Best
+                </button>
               <% end %>
             </div>
           </div>
@@ -341,7 +466,9 @@ defmodule ExAutoresearchWeb.DashboardLive do
               <pre class="text-xs font-mono text-zinc-300 whitespace-pre-wrap"><%= @selected[:code] %></pre>
             </div>
           <% else %>
-            <div class="text-zinc-600 text-center py-12">Click a trial or chart data point to view source code</div>
+            <div class="text-zinc-600 text-center py-12">
+              Click a trial or chart data point to view source code
+            </div>
           <% end %>
         </div>
       </div>
@@ -356,6 +483,7 @@ defmodule ExAutoresearchWeb.DashboardLive do
 
   attr :label, :string, required: true
   attr :value, :any, required: true
+
   defp stat(assigns) do
     ~H"""
     <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4">

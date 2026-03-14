@@ -79,30 +79,38 @@ defmodule ExAutoresearch.Training.Trainer do
 
   @impl true
   def handle_call(:status, _from, state) do
-    {:reply, %{status: state.status, experiment_id: state.experiment_id, result: state.result}, state}
+    {:reply, %{status: state.status, experiment_id: state.experiment_id, result: state.result},
+     state}
   end
 
   # Training implementation
 
   defp run_training(%Config{} = config, experiment_id) do
     n_embd = Config.n_embd(config)
-    Logger.info("[#{experiment_id}] Training: #{config.n_layer}L × #{n_embd}d, vocab=#{config.vocab_size}")
+
+    Logger.info(
+      "[#{experiment_id}] Training: #{config.n_layer}L × #{n_embd}d, vocab=#{config.vocab_size}"
+    )
 
     # Build model
     model = GPT.build(config)
     {init_fn, _predict_fn} = Axon.build(model)
 
     # Initialize params
-    template = %{"input_ids" => Nx.iota({config.device_batch_size, config.sequence_len}, type: :s64)}
+    template = %{
+      "input_ids" => Nx.iota({config.device_batch_size, config.sequence_len}, type: :s64)
+    }
+
     _params = init_fn.(template, Axon.ModelState.empty())
 
     # Setup optimizer
-    optimizer = Polaris.Optimizers.adamw(
-      learning_rate: config.matrix_lr,
-      b1: config.adam_beta1,
-      b2: config.adam_beta2,
-      decay: config.weight_decay
-    )
+    optimizer =
+      Polaris.Optimizers.adamw(
+        learning_rate: config.matrix_lr,
+        b1: config.adam_beta1,
+        b2: config.adam_beta2,
+        decay: config.weight_decay
+      )
 
     # Setup loss function
     loss_fn = fn y_pred, y_true ->
@@ -136,7 +144,9 @@ defmodule ExAutoresearch.Training.Trainer do
           val = Nx.to_number(loss)
           # Skip the initial 0.0 from Axon's running mean
           if val > 0.0, do: Process.put(:last_loss, val)
-        _ -> :ok
+
+        _ ->
+          :ok
       end
 
       start = Process.get(:training_start_time)
@@ -157,10 +167,11 @@ defmodule ExAutoresearch.Training.Trainer do
       progress = min(elapsed / time_budget_ms, 1.0)
 
       if rem(step, 5) == 0 do
-        loss_val = case state.metrics do
-          %{"loss" => loss} -> Nx.to_number(loss)
-          _ -> nil
-        end
+        loss_val =
+          case state.metrics do
+            %{"loss" => loss} -> Nx.to_number(loss)
+            _ -> nil
+          end
 
         lr_mult = Scheduler.lr_multiplier(progress, config)
 
@@ -181,7 +192,9 @@ defmodule ExAutoresearch.Training.Trainer do
       |> Axon.Loop.handle_event(:iteration_completed, log_handler)
       |> Axon.Loop.handle_event(:iteration_completed, halt_handler)
 
-    Logger.info("[#{experiment_id}] Starting training (JIT warmup first, then #{config.time_budget}s)")
+    Logger.info(
+      "[#{experiment_id}] Starting training (JIT warmup first, then #{config.time_budget}s)"
+    )
 
     # Run training — use a large iteration count; halt_handler stops us on time
     final_state = Axon.Loop.run(loop, data, %{}, epochs: 1, iterations: 100_000)
@@ -215,7 +228,9 @@ defmodule ExAutoresearch.Training.Trainer do
       sequence_len: config.sequence_len
     }
 
-    Logger.info("[#{experiment_id}] Training complete: #{result.num_steps} steps in #{result.training_seconds}s")
+    Logger.info(
+      "[#{experiment_id}] Training complete: #{result.num_steps} steps in #{result.training_seconds}s"
+    )
 
     result
   end

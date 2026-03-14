@@ -67,10 +67,16 @@ defmodule ExAutoresearch.Cluster.LocalWorker do
       end
 
     args = [
-      name_flag, full_node_name,
-      "--cookie", cookie,
-      "--erl", "-kernel inet_dist_listen_min 9000 inet_dist_listen_max 9100",
-      "-S", "mix", "run", "--no-halt"
+      name_flag,
+      full_node_name,
+      "--cookie",
+      cookie,
+      "--erl",
+      "-kernel inet_dist_listen_min 9000 inet_dist_listen_max 9100",
+      "-S",
+      "mix",
+      "run",
+      "--no-halt"
     ]
 
     Logger.info("Starting local worker: #{full_node_name} (#{gpu_target})")
@@ -107,6 +113,7 @@ defmodule ExAutoresearch.Cluster.LocalWorker do
     case Node.connect(target) do
       true ->
         Logger.info("Local worker connected: #{target}")
+
         ExAutoresearch.Cluster.register_capabilities(%{
           "gpu_target" => state.gpu_target,
           "role" => "worker"

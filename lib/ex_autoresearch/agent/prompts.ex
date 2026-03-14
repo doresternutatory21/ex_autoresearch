@@ -9,6 +9,7 @@ defmodule ExAutoresearch.Agent.Prompts do
 
   def read(filename) do
     path = Path.join([@prompts_dir, filename])
+
     case File.read(path) do
       {:ok, content} -> content
       {:error, _} -> "# #{filename} not found"
@@ -49,6 +50,7 @@ defmodule ExAutoresearch.Agent.Prompts do
             status = if e.kept, do: "✅ kept", else: "❌ discarded"
             desc = String.slice(e.description || "", 0, 80)
             model_tag = short_model(e.model)
+
             "| v_#{e.version_id} | #{loss} | #{e.num_steps || 0} | #{model_tag} | #{desc} | #{status} |"
           end)
           |> Enum.join("\n")
@@ -79,7 +81,10 @@ defmodule ExAutoresearch.Agent.Prompts do
       end)
       |> Enum.join("\n")
 
-    notable_header = if notable_section != "", do: "## Notable kept versions (source code)\n\n#{notable_section}", else: ""
+    notable_header =
+      if notable_section != "",
+        do: "## Notable kept versions (source code)\n\n#{notable_section}",
+        else: ""
 
     """
     #{best_section}
@@ -104,6 +109,7 @@ defmodule ExAutoresearch.Agent.Prompts do
   defp safe_round(_, _), do: nil
 
   defp short_model(nil), do: "-"
+
   defp short_model(m) do
     m
     |> String.replace("claude-", "")
