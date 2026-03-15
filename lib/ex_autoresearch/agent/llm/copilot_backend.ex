@@ -73,7 +73,22 @@ defmodule ExAutoresearch.Agent.LLM.CopilotBackend do
         {:noreply, %{state | status: :waiting, buffer: "", caller: from}}
 
       {:error, reason} ->
-        {:reply, {:error, reason}, state}
+        # Session may have died — try to recreate it once
+        Logger.warning("Copilot send failed: #{inspect(reason)}. Recreating session...")
+
+        case recreate_session(state) do
+          {:ok, new_state} ->
+            case Connection.send_prompt(new_state.conn, new_state.session_id, text) do
+              {:ok, _msg_id} ->
+                {:noreply, %{new_state | status: :waiting, buffer: "", caller: from}}
+
+              {:error, reason2} ->
+                {:reply, {:error, reason2}, new_state}
+            end
+
+          {:error, _} ->
+            {:reply, {:error, reason}, state}
+        end
     end
   end
 
@@ -120,6 +135,29 @@ defmodule ExAutoresearch.Agent.LLM.CopilotBackend do
   @impl true
   def terminate(_reason, %{conn: conn}) when not is_nil(conn), do: Connection.stop(conn)
   def terminate(_, _), do: :ok
+
+  defp recreate_session(%{conn: conn, session_id: old_sid, model: model} = state) do
+    if old_sid, do: catch_unsubscribe(conn, old_sid)
+
+    case Connection.create_session(conn, %{model: model}) do
+      {:ok, new_sid} ->
+        :ok = Connection.subscribe(conn, new_sid)
+        Logger.info("Copilot session recreated: #{new_sid}")
+        {:ok, %{state | session_id: new_sid, status: :idle}}
+
+      {:error, reason} ->
+        Logger.error("Failed to recreate Copilot session: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp catch_unsubscribe(conn, sid) do
+    Connection.unsubscribe(conn, sid)
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
 
   defp switch_model(%{conn: conn, session_id: old_sid} = state, new_model) do
     if old_sid, do: Connection.unsubscribe(conn, old_sid)

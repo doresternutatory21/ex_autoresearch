@@ -55,7 +55,7 @@ defmodule ExAutoresearch.Agent.LLM do
 
     full_prompt = if system, do: "#{system}\n\n---\n\n#{text}", else: text
 
-    GenServer.call(__MODULE__, {:prompt, full_prompt, model}, :infinity)
+    GenServer.call(__MODULE__, {:prompt, full_prompt, model}, :timer.minutes(5))
   end
 
   @doc "Switch to a different backend and model. Takes effect on next prompt."
@@ -119,7 +119,7 @@ defmodule ExAutoresearch.Agent.LLM do
       {:ok, pid} ->
         # Delegate to the backend GenServer
         Task.start(fn ->
-          result = GenServer.call(pid, {:prompt, text, model}, :infinity)
+          result = GenServer.call(pid, {:prompt, text, model}, :timer.minutes(4))
           GenServer.reply(from, result)
         end)
 

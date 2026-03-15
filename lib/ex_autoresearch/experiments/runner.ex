@@ -10,10 +10,10 @@ defmodule ExAutoresearch.Experiments.Runner do
 
   alias ExAutoresearch.Data.Loader, as: DataLoader
 
-  @default_time_budget 15
+  @default_time_budget to_timeout(minute: 5) |> div(1000)
 
   @run_schema NimbleOptions.new!(
-                time_budget: [type: :pos_integer, default: 15, doc: "Seconds per trial"],
+                time_budget: [type: :pos_integer, default: @default_time_budget, doc: "Seconds per trial"],
                 version_id: [
                   type: :string,
                   default: "unknown",
@@ -72,6 +72,7 @@ defmodule ExAutoresearch.Experiments.Runner do
     Process.delete(:training_start_time)
     Process.delete(:training_steps)
     Process.delete(:last_loss)
+    Process.delete(:loss_history)
 
     time_budget_ms = time_budget * 1000
 
@@ -105,19 +106,24 @@ defmodule ExAutoresearch.Experiments.Runner do
 
         if rem(step, 50) == 0 do
           loss = Process.get(:last_loss)
-          if loss, do: Logger.debug("[#{version_id}] step=#{step} loss=#{safe_round(loss, 6)}")
-        end
 
-        Phoenix.PubSub.broadcast(
-          ExAutoresearch.PubSub,
-          "agent:events",
-          {:step,
-           %{
-             step: step,
-             loss: Process.get(:last_loss),
-             progress: training_progress(time_budget_ms)
-           }}
-        )
+          if loss do
+            history = Process.get(:loss_history, [])
+            Process.put(:loss_history, [[step, loss] | history])
+          end
+          if loss, do: Logger.debug("[#{version_id}] step=#{step} loss=#{safe_round(loss, 6)}")
+
+          Phoenix.PubSub.broadcast(
+            ExAutoresearch.PubSub,
+            "agent:events",
+            {:step,
+             %{
+               step: step,
+               loss: loss,
+               progress: training_progress(time_budget_ms)
+             }}
+          )
+        end
       rescue
         _ -> :ok
       end
@@ -150,7 +156,8 @@ defmodule ExAutoresearch.Experiments.Runner do
       loss: loss,
       steps: steps,
       training_seconds: safe_round(elapsed_s, 1),
-      config: config
+      config: config,
+      loss_history: Process.get(:loss_history, []) |> Enum.reverse() |> downsample(200)
     }
   rescue
     e ->
@@ -162,7 +169,8 @@ defmodule ExAutoresearch.Experiments.Runner do
         loss: nil,
         steps: 0,
         training_seconds: 0,
-        error: Exception.message(e)
+        error: Exception.message(e),
+        loss_history: []
       }
   end
 
@@ -180,4 +188,16 @@ defmodule ExAutoresearch.Experiments.Runner do
   defp safe_round(val, decimals) when is_float(val), do: Float.round(val, decimals)
   defp safe_round(val, _decimals) when is_integer(val), do: val / 1
   defp safe_round(_, _), do: nil
+
+  # Keep at most max_points evenly spaced samples from a list of [step, loss] pairs.
+  defp downsample(points, max_points) when length(points) <= max_points, do: points
+
+  defp downsample(points, max_points) do
+    n = length(points)
+    step = n / max_points
+
+    0..(max_points - 1)
+    |> Enum.map(fn i -> Enum.at(points, round(i * step)) end)
+    |> Enum.reject(&is_nil/1)
+  end
 end

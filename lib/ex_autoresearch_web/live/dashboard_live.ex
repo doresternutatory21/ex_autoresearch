@@ -18,7 +18,16 @@ defmodule ExAutoresearchWeb.DashboardLive do
     end
 
     agent = Researcher.status()
-    trials = load_trials()
+    campaigns = Registry.list_campaigns()
+
+    # If there's an active campaign, select it; otherwise default to "new"
+    {selected_campaign_id, campaign_tag} =
+      case agent.campaign_tag && Enum.find(campaigns, &(&1.tag == agent.campaign_tag)) do
+        %{id: id, tag: tag} -> {id, tag}
+        _ -> {nil, nil}
+      end
+
+    trials = load_trials_for(selected_campaign_id)
 
     selected =
       if agent.best_version, do: load_version(agent.best_version), else: nil
@@ -34,9 +43,14 @@ defmodule ExAutoresearchWeb.DashboardLive do
       |> assign(:best_loss, agent.best_loss)
       |> assign(:best_version, agent.best_version)
       |> assign(:trial_count, agent.trial_count)
-      |> assign(:campaign_tag, agent.campaign_tag)
+      |> assign(:campaign_tag, campaign_tag)
+      |> assign(:campaigns, campaigns)
+      |> assign(:selected_campaign_id, selected_campaign_id)
+      |> assign(:new_campaign_tag, default_tag())
+      |> assign(:time_budget, 300)
       |> assign(:current_step, nil)
       |> assign(:current_progress, nil)
+      |> assign(:trial_losses, [])
       |> assign(:agent_log, [])
       |> assign(:selected, selected)
       |> assign(:current_backend, current_backend)
@@ -52,13 +66,111 @@ defmodule ExAutoresearchWeb.DashboardLive do
 
   @impl true
   def handle_event("start_research", _params, socket) do
-    tag = socket.assigns.campaign_tag || default_tag()
+    tag =
+      if socket.assigns.selected_campaign_id do
+        # Continuing existing campaign
+        socket.assigns.campaign_tag
+      else
+        # New campaign
+        tag = String.trim(socket.assigns.new_campaign_tag)
+        if tag == "", do: default_tag(), else: tag
+      end
+
     model = socket.assigns.current_model
     backend = socket.assigns.current_backend
 
+    time_budget = socket.assigns.time_budget
+
     ExAutoresearch.Agent.LLM.set_backend(backend, model)
-    Researcher.start_research(tag: tag, model: model)
-    {:noreply, socket |> assign(:agent_status, :running) |> assign(:campaign_tag, tag)}
+    Researcher.start_research(tag: tag, model: model, time_budget: time_budget)
+
+    # Refresh campaigns list (new campaign may have been created)
+    campaigns = Registry.list_campaigns()
+    campaign = Enum.find(campaigns, &(&1.tag == tag))
+
+    {:noreply,
+     socket
+     |> assign(:agent_status, :running)
+     |> assign(:campaign_tag, tag)
+     |> assign(:campaigns, campaigns)
+     |> assign(:selected_campaign_id, campaign && campaign.id)}
+  end
+
+  @impl true
+  def handle_event("select_campaign", %{"campaign" => "new"}, socket) do
+    {:noreply,
+     socket
+     |> assign(:selected_campaign_id, nil)
+     |> assign(:campaign_tag, nil)
+     |> assign(:best_loss, nil)
+     |> assign(:best_version, nil)
+     |> assign(:trial_count, 0)
+     |> assign(:time_budget, 300)
+     |> assign(:selected, nil)
+     |> assign(:chart_trials, [])
+     |> stream(:trials, [], reset: true)
+     |> push_chart()}
+  end
+
+  @impl true
+  def handle_event("select_campaign", %{"campaign" => campaign_id}, socket) do
+    campaign = Enum.find(socket.assigns.campaigns, &(&1.id == campaign_id))
+
+    if campaign do
+      trials = load_trials_for(campaign.id)
+      best = Registry.best_trial(campaign.id)
+      trial_count = Registry.count_trials(campaign.id)
+      selected = if best, do: load_version(best.version_id), else: nil
+
+      {:noreply,
+       socket
+       |> assign(:selected_campaign_id, campaign.id)
+       |> assign(:campaign_tag, campaign.tag)
+       |> assign(:best_loss, best && best.final_loss)
+       |> assign(:best_version, best && best.version_id)
+       |> assign(:trial_count, trial_count)
+       |> assign(:time_budget, campaign.time_budget)
+       |> assign(:selected, selected)
+       |> assign(:chart_trials, trials)
+       |> stream(:trials, trials, reset: true)
+       |> push_chart()}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  @impl true
+  def handle_event("update_new_tag", %{"tag" => tag}, socket) do
+    {:noreply, assign(socket, :new_campaign_tag, tag)}
+  end
+
+  @impl true
+  def handle_event("change_time_budget", params, socket) do
+    case params do
+      %{"time_budget" => val} ->
+        case Integer.parse(val) do
+          {seconds, _} when seconds > 0 ->
+            socket = assign(socket, :time_budget, seconds)
+
+            if socket.assigns.selected_campaign_id do
+              case Registry.get_campaign_by_id(socket.assigns.selected_campaign_id) do
+                {:ok, run} when not is_nil(run) ->
+                  Registry.update_campaign_time_budget(run, seconds)
+
+                _ ->
+                  :ok
+              end
+            end
+
+            {:noreply, add_log(socket, "⏱ Time budget → #{seconds}s")}
+
+          _ ->
+            {:noreply, socket}
+        end
+
+      _ ->
+        {:noreply, socket}
+    end
   end
 
   @impl true
@@ -69,15 +181,17 @@ defmodule ExAutoresearchWeb.DashboardLive do
 
   @impl true
   def handle_event("select_version", %{"version" => vid}, socket) do
-    {:noreply, assign(socket, :selected, load_version(vid))}
+    selected = load_version(vid)
+    socket = assign(socket, :selected, selected)
+    {:noreply, push_trial_chart(socket, selected[:loss_history] || [])}
   end
 
   @impl true
   def handle_event("select_best", _params, socket) do
     agent = Researcher.status()
-
-    {:noreply,
-     assign(socket, :selected, if(agent.best_version, do: load_version(agent.best_version)))}
+    selected = if(agent.best_version, do: load_version(agent.best_version))
+    socket = assign(socket, :selected, selected)
+    {:noreply, push_trial_chart(socket, (selected && selected[:loss_history]) || [])}
   end
 
   @impl true
@@ -114,14 +228,20 @@ defmodule ExAutoresearchWeb.DashboardLive do
   @impl true
   def handle_info(:tick, socket) do
     agent = Researcher.status()
-    # Only update data fields from DB, not user-controlled ones (model, status)
-    # Status and model come from PubSub events to avoid races
-    {:noreply,
-     socket
-     |> assign(:best_loss, agent.best_loss)
-     |> assign(:best_version, agent.best_version)
-     |> assign(:trial_count, agent.trial_count)
-     |> assign(:campaign_tag, agent.campaign_tag || socket.assigns.campaign_tag)}
+    campaigns = Registry.list_campaigns()
+
+    # Only update stats if viewing the actively running campaign
+    socket =
+      if agent.campaign_tag && agent.campaign_tag == socket.assigns.campaign_tag do
+        socket
+        |> assign(:best_loss, agent.best_loss)
+        |> assign(:best_version, agent.best_version)
+        |> assign(:trial_count, agent.trial_count)
+      else
+        socket
+      end
+
+    {:noreply, assign(socket, :campaigns, campaigns)}
   end
 
   @impl true
@@ -130,6 +250,8 @@ defmodule ExAutoresearchWeb.DashboardLive do
      socket
      |> assign(:current_step, 0)
      |> assign(:current_progress, 0)
+     |> assign(:trial_losses, [])
+     |> push_trial_chart([])
      |> add_log("🧪 Started: #{p[:description]} (v_#{p[:version_id]})")}
   end
 
@@ -146,6 +268,7 @@ defmodule ExAutoresearchWeb.DashboardLive do
       |> stream_insert(:trials, entry, at: 0)
       |> assign(:current_step, nil)
       |> assign(:current_progress, nil)
+      |> assign(:trial_losses, [])
       |> assign(:chart_trials, chart_trials)
       |> add_log("#{tag} v_#{r[:version_id]} loss=#{safe_fmt(r[:loss])} — #{r[:description]}")
 
@@ -157,10 +280,23 @@ defmodule ExAutoresearchWeb.DashboardLive do
 
   @impl true
   def handle_info({:step, p}, socket) do
-    {:noreply,
-     socket |> assign(:current_step, p[:step]) |> assign(:current_progress, p[:progress])}
+    step = p[:step]
+    loss = p[:loss]
+
+    socket = socket |> assign(:current_step, step) |> assign(:current_progress, p[:progress])
+
+    # Accumulate loss data every 50 steps and push chart update
+    if loss && step && rem(step, 50) == 0 do
+      trial_losses = socket.assigns.trial_losses ++ [[step, loss]]
+      {:noreply, socket |> assign(:trial_losses, trial_losses) |> push_trial_chart(trial_losses)}
+    else
+      {:noreply, socket}
+    end
   end
 
+  @impl true
+  def handle_info({:experiment_error, p}, socket),
+    do: {:noreply, add_log(socket, "⚠️ Error (#{p[:attempt]}/#{p[:max]}): #{p[:error]}")}
   @impl true
   def handle_info({:agent_thinking, _}, socket), do: {:noreply, add_log(socket, "🤔 Thinking...")}
   @impl true
@@ -184,8 +320,10 @@ defmodule ExAutoresearchWeb.DashboardLive do
     assign(socket, :agent_log, ["#{ts} #{msg}" | socket.assigns.agent_log] |> Enum.take(100))
   end
 
-  defp load_trials do
-    Researcher.experiments()
+  defp load_trials_for(nil), do: []
+
+  defp load_trials_for(campaign_id) do
+    Registry.all_trials(campaign_id)
     |> Enum.map(&trial_to_map/1)
     |> Enum.reverse()
   end
@@ -239,13 +377,26 @@ defmodule ExAutoresearchWeb.DashboardLive do
           kept: exp.kept,
           status: exp.status,
           model: exp.model,
-          mermaid: mermaid
+          mermaid: mermaid,
+          loss_history: decode_loss_history(exp.loss_history)
         }
 
       _ ->
         nil
     end
   end
+
+  defp decode_loss_history(nil), do: []
+  defp decode_loss_history(""), do: []
+
+  defp decode_loss_history(json) when is_binary(json) do
+    case Jason.decode(json) do
+      {:ok, points} -> points
+      _ -> []
+    end
+  end
+
+  defp decode_loss_history(_), do: []
 
   defp build_mermaid(exp) do
     if exp.code do
@@ -285,9 +436,6 @@ defmodule ExAutoresearchWeb.DashboardLive do
       |> Enum.reverse()
       |> Enum.filter(& &1[:loss])
 
-    losses = Enum.map(trials, & &1[:loss])
-    y_max = chart_y_max(losses)
-
     data =
       Enum.with_index(trials)
       |> Enum.map(fn {t, i} ->
@@ -299,20 +447,17 @@ defmodule ExAutoresearchWeb.DashboardLive do
       end)
 
     y_axis = %{
-      type: "value",
+      type: "log",
       name: "Loss",
       nameLocation: "center",
       nameGap: 45,
-      min: 0,
       axisLabel: %{formatter: "{value}"}
     }
-
-    y_axis = if y_max, do: Map.put(y_axis, :max, y_max), else: y_axis
 
     chart_option = %{
       backgroundColor: "transparent",
       tooltip: %{trigger: "item", formatter: "{c}"},
-      xAxis: %{type: "value", name: "Trial #", nameLocation: "center", nameGap: 25},
+      xAxis: %{type: "value", name: "Trial #", nameLocation: "center", nameGap: 25, minInterval: 1},
       yAxis: y_axis,
       series: [
         %{
@@ -327,22 +472,26 @@ defmodule ExAutoresearchWeb.DashboardLive do
     push_event(socket, "chart-data-loss-chart", chart_option)
   end
 
-  # Compute a Y-axis max that suppresses extreme outliers using IQR method.
-  # Returns nil if fewer than 4 data points (let ECharts auto-scale).
-  defp chart_y_max(losses) when length(losses) < 4, do: nil
+  defp push_trial_chart(socket, data) do
+    chart_option = %{
+      backgroundColor: "transparent",
+      tooltip: %{trigger: "axis"},
+      xAxis: %{type: "value", name: "Step", nameLocation: "center", nameGap: 25},
+      yAxis: %{type: "value", name: "Loss", nameLocation: "center", nameGap: 45},
+      series: [
+        %{
+          type: "line",
+          showSymbol: false,
+          smooth: true,
+          lineStyle: %{color: "#818cf8", width: 2},
+          data: data
+        }
+      ]
+    }
 
-  defp chart_y_max(losses) do
-    sorted = Enum.sort(losses)
-    n = length(sorted)
-    q1 = Enum.at(sorted, div(n, 4))
-    q3 = Enum.at(sorted, div(3 * n, 4))
-    iqr = q3 - q1
-    fence = q3 + 1.5 * iqr
-
-    # Use the fence as max, but at least include the median * 3 so the chart isn't too tight
-    median = Enum.at(sorted, div(n, 2))
-    max(fence, median * 3) |> Float.ceil(1)
+    push_event(socket, "chart-data-trial-loss-chart", chart_option)
   end
+
 
   defp safe_fmt(nil), do: "-"
   defp safe_fmt(l) when is_float(l), do: :erlang.float_to_binary(l, decimals: 6)
@@ -417,6 +566,36 @@ defmodule ExAutoresearchWeb.DashboardLive do
             </p>
           </div>
           <div class="flex items-center gap-2">
+            <form phx-change="select_campaign">
+              <select name="campaign"
+                class="bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-2 py-1.5 focus:ring-indigo-500 focus:border-indigo-500">
+                <option value="new" selected={@selected_campaign_id == nil}>+ New campaign</option>
+                <%= for c <- @campaigns do %>
+                  <option value={c.id} selected={c.id == @selected_campaign_id}>
+                    {c.tag} ({c.status})
+                  </option>
+                <% end %>
+              </select>
+            </form>
+            <%= if @selected_campaign_id == nil do %>
+              <form phx-change="update_new_tag">
+                <input
+                  type="text"
+                  name="tag"
+                  value={@new_campaign_tag}
+                  placeholder="campaign tag"
+                  class="bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-2 py-1.5 w-32 focus:ring-indigo-500 focus:border-indigo-500"
+                />
+              </form>
+            <% end %>
+            <form phx-change="change_time_budget" class="flex items-center gap-1">
+              <select name="time_budget"
+                class="bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-2 py-1.5 focus:ring-indigo-500 focus:border-indigo-500">
+                <%= for {secs, label} <- [{15, "15s"}, {60, "1m"}, {120, "2m"}, {300, "5m"}, {600, "10m"}, {900, "15m"}] do %>
+                  <option value={secs} selected={secs == @time_budget}><%= label %></option>
+                <% end %>
+              </select>
+            </form>
             <form phx-change="change_backend">
               <select name="backend" id="backend-select"
                 class="bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-2 py-1.5 focus:ring-indigo-500 focus:border-indigo-500">
@@ -443,7 +622,7 @@ defmodule ExAutoresearchWeb.DashboardLive do
                 phx-click="start_research"
                 class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-sm font-medium transition"
               >
-                ▶ Start
+                {if @selected_campaign_id, do: "▶ Continue", else: "▶ Start"}
               </button>
             <% else %>
               <button
@@ -473,10 +652,17 @@ defmodule ExAutoresearchWeb.DashboardLive do
           <.stat label="Progress" value={(@current_progress && "#{@current_progress}%") || "-"} />
         </div>
 
-        <%!-- Chart --%>
-        <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
-          <h2 class="text-lg font-semibold text-zinc-200 mb-2">📈 Loss over Trials</h2>
-          <div id="loss-chart" phx-hook="Chart" phx-update="ignore" style="width:100%; height:250px;">
+        <%!-- Charts --%>
+        <div class="grid grid-cols-2 gap-5">
+          <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+            <h2 class="text-lg font-semibold text-zinc-200 mb-2">📈 Loss over Trials</h2>
+            <div id="loss-chart" phx-hook="Chart" phx-update="ignore" style="width:100%; height:250px;">
+            </div>
+          </div>
+          <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+            <h2 class="text-lg font-semibold text-zinc-200 mb-2">📉 Current Trial Loss</h2>
+            <div id="trial-loss-chart" phx-hook="Chart" phx-update="ignore" style="width:100%; height:250px;">
+            </div>
           </div>
         </div>
 

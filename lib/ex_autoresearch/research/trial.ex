@@ -41,7 +41,7 @@ defmodule ExAutoresearch.Research.Trial do
     end
 
     update :complete do
-      accept [:status, :final_loss, :training_seconds, :num_steps, :kept, :error]
+      accept [:status, :final_loss, :training_seconds, :num_steps, :kept, :error, :loss_history]
     end
   end
 
@@ -66,6 +66,7 @@ defmodule ExAutoresearch.Research.Trial do
     attribute :num_steps, :integer
     attribute :kept, :boolean, default: false
     attribute :error, :string
+    attribute :loss_history, :string
 
     timestamps()
   end
