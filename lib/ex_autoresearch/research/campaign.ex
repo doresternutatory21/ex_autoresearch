@@ -29,7 +29,7 @@ defmodule ExAutoresearch.Research.Campaign do
     end
 
     update :update_time_budget do
-      accept [:time_budget]
+      accept [:time_budget, :step_budget]
     end
   end
 

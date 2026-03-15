@@ -168,6 +168,11 @@ defmodule ExAutoresearch.Agent.Researcher do
 
         {:ok, existing} ->
           Logger.info("Resuming run: #{tag} (#{Registry.count_trials(existing.id)} experiments)")
+          # Update budget settings from UI on resume
+          existing = Ash.update!(existing, %{
+            time_budget: time_budget,
+            step_budget: step_budget
+          }, action: :update_time_budget)
           Registry.resume_campaign(existing)
       end
 
