@@ -397,6 +397,8 @@ defmodule ExAutoresearch.Agent.Researcher do
     end
   end
 
+  @max_fix_attempts 2
+
   defp propose_and_run(run, label, target_node, llm_pid) do
     version_id = gen_id()
     all_exps = Registry.all_trials(run.id)
@@ -418,26 +420,61 @@ defmodule ExAutoresearch.Agent.Researcher do
 
         code = Loader.inject_version_id(code, version_id)
 
-        case Loader.load(version_id, code) do
-          {:ok, module} ->
-            Registry.cache_module(version_id, module)
+        case try_load_and_run(run, label, target_node, llm_pid, version_id, code, description, reasoning, best, effective_budget, 0) do
+          :ok -> :ok
+          {:error, _} = err -> err
+        end
 
-            experiment =
-              Registry.record_trial(%{
-                campaign_id: run.id,
-                version_id: version_id,
-                code: code,
-                description: description,
-                reasoning: reasoning,
-                parent_id: best && best.id,
-                model: run.model,
-                status: :running
-              })
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
-            broadcast(:trial_started, %{version_id: version_id, description: description, gpu: label})
+  # Try to load and run. On compile or training crash, send the error back
+  # to the LLM for a fix attempt (up to @max_fix_attempts times).
+  defp try_load_and_run(run, label, target_node, llm_pid, version_id, code, description, reasoning, best, effective_budget, fix_attempt) do
+    case Loader.load(version_id, code) do
+      {:ok, module} ->
+        Registry.cache_module(version_id, module)
 
-            result = run_on_node(target_node, module, code, version_id, effective_budget, run.step_budget)
+        experiment =
+          Registry.record_trial(%{
+            campaign_id: run.id,
+            version_id: version_id,
+            code: code,
+            description: description,
+            reasoning: reasoning,
+            parent_id: best && best.id,
+            model: run.model,
+            status: :running
+          })
 
+        broadcast(:trial_started, %{version_id: version_id, description: description, gpu: label})
+
+        result = run_on_node(target_node, module, code, version_id, effective_budget, run.step_budget)
+
+        case result[:status] do
+          :crashed when fix_attempt < @max_fix_attempts ->
+            # Training crashed — ask LLM to fix
+            error_msg = result[:error] || "Unknown training error"
+            Logger.warning("[#{label}] v_#{version_id} crashed (attempt #{fix_attempt + 1}), asking LLM to fix: #{String.slice(error_msg, 0, 200)}")
+
+            Registry.complete_trial(experiment, %{
+              status: :crashed,
+              error: error_msg,
+              training_seconds: result[:training_seconds],
+              num_steps: result[:steps]
+            })
+
+            broadcast(:trial_completed, %{
+              version_id: version_id, description: description, kept: false,
+              status: :crashed, loss: nil, steps: 0, model: run.model, gpu: label, error: error_msg
+            })
+
+            ask_llm_to_fix(run, label, target_node, llm_pid, version_id, code, error_msg, best, effective_budget, fix_attempt)
+
+          _ ->
+            # Normal completion (success, halted, or final crash)
             loss = sanitize_loss(result[:loss])
             halted? = result[:status] == :halted
             kept = if halted?, do: false, else: decide_keep(loss, best && best.final_loss)
@@ -449,59 +486,104 @@ defmodule ExAutoresearch.Agent.Researcher do
                 true -> :crashed
               end
 
-            experiment =
-              Registry.complete_trial(experiment, %{
-                final_loss: loss,
-                num_steps: result[:steps],
-                training_seconds: result[:training_seconds],
-                status: trial_status,
-                kept: kept,
-                loss_history: Jason.encode!(result[:loss_history] || [])
-              })
+            Registry.complete_trial(experiment, %{
+              final_loss: loss,
+              num_steps: result[:steps],
+              training_seconds: result[:training_seconds],
+              status: trial_status,
+              kept: kept,
+              loss_history: Jason.encode!(result[:loss_history] || [])
+            })
 
             if kept, do: Registry.update_campaign_best(run, experiment.id)
 
-            broadcast(
-              :trial_completed,
-              Map.merge(result, %{
-                description: description,
-                kept: kept,
-                model: run.model,
-                gpu: label
-              })
-            )
-
-            :ok
-
-          {:error, reason} ->
-            Logger.error("[#{label}] Module v_#{version_id} failed to load: #{inspect(reason)}")
-
-            Registry.record_trial(%{
-              campaign_id: run.id,
-              version_id: version_id,
-              code: code,
-              description: description,
-              reasoning: reasoning,
-              parent_id: best && best.id,
-              model: run.model,
-              status: :crashed,
-              error: inspect(reason)
-            })
-
-            broadcast(:trial_completed, %{
-              version_id: version_id,
-              description: description,
-              kept: false,
-              status: :crashed,
-              loss: nil,
-              steps: 0,
-              model: run.model,
-              gpu: label,
-              error: inspect(reason)
-            })
+            broadcast(:trial_completed,
+              Map.merge(result, %{description: description, kept: kept, model: run.model, gpu: label}))
 
             :ok
         end
+
+      {:error, reason} when fix_attempt < @max_fix_attempts ->
+        # Compilation failed — ask LLM to fix
+        error_msg = inspect(reason)
+        Logger.warning("[#{label}] v_#{version_id} compile failed (attempt #{fix_attempt + 1}): #{String.slice(error_msg, 0, 200)}")
+
+        Registry.record_trial(%{
+          campaign_id: run.id, version_id: version_id, code: code,
+          description: description, reasoning: reasoning,
+          parent_id: best && best.id, model: run.model,
+          status: :crashed, error: error_msg
+        })
+
+        broadcast(:trial_completed, %{
+          version_id: version_id, description: description, kept: false,
+          status: :crashed, loss: nil, steps: 0, model: run.model, gpu: label, error: error_msg
+        })
+
+        ask_llm_to_fix(run, label, target_node, llm_pid, version_id, code, error_msg, best, effective_budget, fix_attempt)
+
+      {:error, reason} ->
+        # Final attempt failed — record and move on
+        error_msg = inspect(reason)
+        Logger.error("[#{label}] v_#{version_id} compile failed (giving up): #{String.slice(error_msg, 0, 200)}")
+
+        Registry.record_trial(%{
+          campaign_id: run.id, version_id: version_id, code: code,
+          description: description, reasoning: reasoning,
+          parent_id: best && best.id, model: run.model,
+          status: :crashed, error: error_msg
+        })
+
+        broadcast(:trial_completed, %{
+          version_id: version_id, description: description, kept: false,
+          status: :crashed, loss: nil, steps: 0, model: run.model, gpu: label, error: error_msg
+        })
+
+        :ok
+    end
+  end
+
+  defp ask_llm_to_fix(run, label, target_node, llm_pid, _old_version_id, old_code, error_msg, best, effective_budget, fix_attempt) do
+    new_version_id = gen_id()
+
+    fix_prompt = """
+    #{Prompts.system_prompt()}
+
+    ---
+
+    ## Fix required
+
+    Your previous experiment code CRASHED with this error:
+
+    ```
+    #{String.slice(error_msg, 0, 1000)}
+    ```
+
+    The code that crashed:
+
+    ```elixir
+    #{old_code}
+    ```
+
+    Fix the error and generate a corrected version. The module must be named
+    ExAutoresearch.Experiments.V_#{new_version_id}.
+
+    Output ONLY the complete defmodule block — no explanation outside the code.
+    Put your reasoning in the @moduledoc string.
+    """
+
+    Logger.info("[#{label}] Asking LLM to fix crash → v_#{new_version_id} (attempt #{fix_attempt + 1}/#{@max_fix_attempts})")
+    broadcast(:agent_thinking, %{version_id: new_version_id})
+
+    case GenServer.call(llm_pid, {:prompt, fix_prompt, run.model}, :timer.minutes(5)) do
+      {:ok, response} ->
+        {code, description, reasoning} = parse_response(response, new_version_id)
+        description = "fix: #{description}"
+        broadcast(:agent_responded, %{reasoning: reasoning, description: description})
+
+        code = Loader.inject_version_id(code, new_version_id)
+
+        try_load_and_run(run, label, target_node, llm_pid, new_version_id, code, description, reasoning, best, effective_budget, fix_attempt + 1)
 
       {:error, reason} ->
         {:error, reason}
