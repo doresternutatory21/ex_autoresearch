@@ -302,7 +302,17 @@ defmodule ExAutoresearch.Agent.Researcher do
     run = Ash.get!(ExAutoresearch.Research.Campaign, run.id)
 
     if run.status == :running do
-      case propose_and_run(run, label, target_node, llm_pid) do
+      # Check if there's a migration waiting for this GPU
+      action =
+        case check_migration_queue(target_node) do
+          {:migrate, migration} ->
+            resume_migrated_trial(run, label, target_node, migration)
+
+          :none ->
+            propose_and_run(run, label, target_node, llm_pid)
+        end
+
+      case action do
         :ok ->
           gpu_loop(run, label, target_node, 0, llm_pid)
 
@@ -608,4 +618,83 @@ defmodule ExAutoresearch.Agent.Researcher do
   end
 
   defp gen_id, do: :crypto.strong_rand_bytes(4) |> Base.hex_encode32(case: :lower, padding: false)
+
+  # --- Migration queue ---
+  # ETS table for pending GPU migrations. The referee writes here,
+  # gpu_loops check before proposing a new experiment.
+
+  @migration_table __MODULE__.Migrations
+
+  defp init_migration_table do
+    if :ets.whereis(@migration_table) == :undefined do
+      :ets.new(@migration_table, [:named_table, :set, :public])
+    end
+  end
+
+  @doc false
+  def queue_migration(target_node, migration) do
+    init_migration_table()
+    :ets.insert(@migration_table, {target_node, migration})
+  end
+
+  defp check_migration_queue(target_node) do
+    init_migration_table()
+
+    case :ets.lookup(@migration_table, target_node) do
+      [{_, migration}] ->
+        :ets.delete(@migration_table, target_node)
+        {:migrate, migration}
+
+      [] ->
+        :none
+    end
+  end
+
+  defp resume_migrated_trial(run, label, target_node, migration) do
+    %{version_id: vid, code: code, checkpoint: checkpoint} = migration
+    Logger.info("[#{label}] 🔄 Resuming migrated trial v_#{vid} from checkpoint")
+
+    broadcast(:trial_started, %{version_id: vid, description: "migrated from slower GPU", gpu: label})
+
+    result =
+      case :rpc.call(target_node, Runner, :resume,
+             [Module.concat(ExAutoresearch.Experiments, "V_#{vid}"),
+              checkpoint,
+              [version_id: vid, time_budget: effective_time_budget(run, 0), step_budget: run.step_budget]],
+             :infinity) do
+        {:badrpc, reason} ->
+          Logger.error("[#{vid}] Remote resume failed: #{inspect(reason, limit: 3)}")
+          %{version_id: vid, status: :crashed, loss: nil, steps: 0, training_seconds: 0, error: inspect(reason), loss_history: []}
+
+        result when is_map(result) ->
+          result
+      end
+
+    loss = sanitize_loss(result[:loss])
+    best = Registry.best_trial(run.id)
+    kept = decide_keep(loss, best && best.final_loss)
+
+    # Update the existing trial record
+    case Registry.get_trial(vid) do
+      {:ok, experiment} when not is_nil(experiment) ->
+        Registry.complete_trial(experiment, %{
+          final_loss: loss,
+          num_steps: result[:steps],
+          training_seconds: result[:training_seconds],
+          status: if(loss, do: :completed, else: :crashed),
+          kept: kept,
+          loss_history: Jason.encode!(result[:loss_history] || [])
+        })
+
+        if kept, do: Registry.update_campaign_best(run, experiment.id)
+
+      _ ->
+        :ok
+    end
+
+    broadcast(:trial_completed,
+      Map.merge(result, %{description: "migrated v_#{vid}", kept: kept, model: run.model, gpu: label}))
+
+    :ok
+  end
 end

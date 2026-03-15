@@ -5,9 +5,10 @@ defmodule ExAutoresearch.Experiments.Runner do
   Takes a module that implements build/0, config/0, optimizer/0,
   trains it for the time budget, and returns results.
 
-  Supports external early-stop signals via `halt/1` — the halt_handler
-  checks a process dictionary flag every iteration, allowing the
-  researcher to kill losing trials mid-flight.
+  Supports:
+  - External early-stop signals via `halt/1`
+  - Checkpoint serialization when halted for GPU migration
+  - Resuming from a serialized checkpoint via `resume/3`
   """
 
   require Logger
@@ -15,18 +16,37 @@ defmodule ExAutoresearch.Experiments.Runner do
   alias ExAutoresearch.Data.Loader, as: DataLoader
 
   @halt_table __MODULE__.HaltSignals
+  @checkpoint_table __MODULE__.Checkpoints
 
-  def init_halt_table do
+  def init_tables do
     if :ets.whereis(@halt_table) == :undefined do
       :ets.new(@halt_table, [:named_table, :set, :public, write_concurrency: true])
+    end
+
+    if :ets.whereis(@checkpoint_table) == :undefined do
+      :ets.new(@checkpoint_table, [:named_table, :set, :public])
     end
   end
 
   @doc "Signal a running trial to stop early."
   def halt(version_id) do
-    init_halt_table()
+    init_tables()
     :ets.insert(@halt_table, {version_id, true})
     Logger.info("[#{version_id}] Halt signal sent")
+  end
+
+  @doc "Retrieve a serialized checkpoint for a halted trial."
+  def get_checkpoint(version_id) do
+    case :ets.whereis(@checkpoint_table) do
+      :undefined -> nil
+      _ ->
+        case :ets.lookup(@checkpoint_table, version_id) do
+          [{_, checkpoint}] ->
+            :ets.delete(@checkpoint_table, version_id)
+            checkpoint
+          _ -> nil
+        end
+    end
   end
 
   defp halted?(version_id) do
@@ -77,21 +97,45 @@ defmodule ExAutoresearch.Experiments.Runner do
     time_budget = opts[:time_budget]
     step_budget = opts[:step_budget]
     version_id = opts[:version_id]
-    init_halt_table()
+    init_tables()
     clear_halt(version_id)
-    do_run(module, version_id, time_budget, step_budget)
+    do_run(module, version_id, time_budget, step_budget, nil)
   end
 
-  defp do_run(module, version_id, time_budget, step_budget) do
+  @doc """
+  Resume training from a serialized checkpoint.
+
+  The checkpoint contains the full Axon.Loop.State (model params +
+  optimizer state). Training continues from where it left off,
+  running for `remaining_steps` more steps.
+  """
+  @spec resume(module(), binary(), keyword()) :: map()
+  def resume(module, checkpoint_binary, opts \\ []) do
+    opts = NimbleOptions.validate!(opts, @run_schema)
+    time_budget = opts[:time_budget]
+    step_budget = opts[:step_budget]
+    version_id = opts[:version_id]
+    init_tables()
+    clear_halt(version_id)
+
+    prev_state = Axon.Loop.deserialize_state(checkpoint_binary)
+    completed_steps = prev_state.iteration
+    Logger.info("[#{version_id}] Resuming from checkpoint at step #{completed_steps}")
+
+    do_run(module, version_id, time_budget, step_budget, prev_state)
+  end
+
+  defp do_run(module, version_id, time_budget, step_budget, prev_state) do
     config = module.config()
     vocab_size = config[:vocab_size] || 256
     seq_len = config[:sequence_len] || config[:seq_len] || 32
     batch_size = config[:batch_size] || config[:device_batch_size] || 4
 
-    Logger.info("[#{version_id}] Training: #{inspect(config, limit: 5)}")
+    completed_steps = if prev_state, do: prev_state.iteration, else: 0
+    Logger.info("[#{version_id}] Training: #{inspect(config, limit: 5)}#{if completed_steps > 0, do: " (resuming from step #{completed_steps})"}")
 
     model = module.build()
-    {opt_init, _opt_update} = optimizer = module.optimizer()
+    {_opt_init, _opt_update} = optimizer = module.optimizer()
 
     loss_fn =
       if function_exported?(module, :loss_fn, 2) do
@@ -122,11 +166,11 @@ defmodule ExAutoresearch.Experiments.Runner do
     halt_handler = fn state ->
       unless Process.get(:training_start_time) do
         Process.put(:training_start_time, System.monotonic_time(:millisecond))
-        Process.put(:training_steps, 0)
+        Process.put(:training_steps, completed_steps)
         Logger.info("[#{version_id}] JIT warmup done, starting training: #{budget_label}")
       end
 
-      steps = (Process.get(:training_steps) || 0) + 1
+      steps = (Process.get(:training_steps) || completed_steps) + 1
       Process.put(:training_steps, steps)
 
       case state.metrics do
@@ -188,20 +232,33 @@ defmodule ExAutoresearch.Experiments.Runner do
       Axon.Loop.trainer(model, loss_fn, optimizer, log: 0)
       |> Axon.Loop.handle_event(:iteration_completed, progress_handler)
       |> Axon.Loop.handle_event(:iteration_completed, halt_handler)
+      |> Map.put(:output_transform, fn state -> state end)
+
+    # Attach previous state for resume
+    loop = if prev_state, do: Axon.Loop.from_state(loop, prev_state), else: loop
+
+    remaining = if step_budget, do: step_budget - completed_steps, else: 1_000_000
 
     Logger.info("[#{version_id}] Starting training (JIT warmup, then #{budget_label})")
 
-    _final = Axon.Loop.run(loop, data, %{}, epochs: 1, iterations: 1_000_000)
+    final_state = Axon.Loop.run(loop, data, %{}, epochs: 1, iterations: remaining)
 
     training_start = Process.get(:training_start_time) || System.monotonic_time(:millisecond)
     elapsed_s = (System.monotonic_time(:millisecond) - training_start) / 1000
 
-    steps = Process.get(:training_steps, 0)
+    steps = Process.get(:training_steps, 0) + completed_steps
     loss = Process.get(:last_loss)
     was_halted = halted?(version_id)
     clear_halt(version_id)
 
     status = if was_halted, do: :halted, else: :completed
+
+    # Serialize checkpoint for GPU migration when halted early
+    if was_halted and is_struct(final_state, Axon.Loop.State) do
+      checkpoint = Axon.Loop.serialize_state(final_state, [:compressed])
+      :ets.insert(@checkpoint_table, {version_id, checkpoint})
+      Logger.info("[#{version_id}] Checkpoint saved (#{div(byte_size(checkpoint), 1024)} KB)")
+    end
 
     Logger.info(
       "[#{version_id}] Done: #{steps} steps in #{safe_round(elapsed_s, 1)}s, loss=#{loss && safe_round(loss, 6)}#{if was_halted, do: " (halted by referee)"}"
