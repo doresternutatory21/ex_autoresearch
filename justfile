@@ -1,66 +1,105 @@
-# Start the main node on ROCm iGPU (visible output, logs to run.log)
+# --- Lifecycle ---
+
+# Start the full application (main node + CUDA worker if available)
 start:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SNAME="$(basename "$(pwd)")"
+    export PORT="${PORT:-$(phx-port)}"
+    export GPU_TARGET="${GPU_TARGET:-rocm}"
+
+    # Ensure the ROCm XLA extension is in place for the main node
+    just _snapshot-xla dev rocm
+
+    echo "Starting $SNAME on GPU_TARGET=$GPU_TARGET, port $PORT"
+    elixir --sname "$SNAME" --cookie devcookie -S mix phx.server > run.log 2>&1 &
+    echo $! > .dev_node.pid
+    scripts/dev_node.sh await
+    echo "Main node $SNAME is up (pid $(cat .dev_node.pid))"
+
+# Stop the full application (main node + any CUDA workers)
+stop:
+    #!/usr/bin/env bash
+    # Stop main node gracefully (this also terminates supervised CUDA workers)
+    if scripts/dev_node.sh status > /dev/null 2>&1; then
+        scripts/dev_node.sh rpc "System.halt()" 2>/dev/null || true
+        # Wait for main node to actually stop
+        for i in $(seq 1 10); do
+            scripts/dev_node.sh status > /dev/null 2>&1 || break
+            sleep 1
+        done
+    fi
+    # Clean up any orphaned CUDA workers (Port-spawned children may outlive parent)
+    for pid in $(ps aux | grep '[c]uda_worker.*mix' | awk '{print $2}'); do
+        echo "Cleaning up orphaned CUDA worker (pid $pid)"
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    rm -f .dev_node.pid
+    echo "Stopped"
+
+# Start in foreground (visible output, for debugging)
+start-fg:
     #!/usr/bin/env bash
     SNAME="$(basename "$(pwd)")"
     export PORT="${PORT:-$(phx-port)}"
     export GPU_TARGET="${GPU_TARGET:-rocm}"
+    just _snapshot-xla dev rocm
     echo "Starting $SNAME on GPU_TARGET=$GPU_TARGET, port $PORT"
     exec elixir --sname "$SNAME" --cookie devcookie -S mix phx.server 2>&1 | tee run.log
 
-# Start the main node in background (logs to run.log only)
-start-bg:
-    #!/usr/bin/env bash
-    SNAME="$(basename "$(pwd)")"
-    export PORT="${PORT:-$(phx-port)}"
-    export GPU_TARGET="${GPU_TARGET:-rocm}"
-    echo "Starting $SNAME (bg) on GPU_TARGET=$GPU_TARGET, port $PORT"
-    exec elixir --sname "$SNAME" --cookie devcookie -S mix phx.server > run.log 2>&1
+# --- Build ---
 
-# Start a CUDA worker node (separate BEAM, same machine)
-# Requires: just compile-cuda (one-time)
-start-cuda NAME="cuda_worker":
-    #!/usr/bin/env bash
-    echo "Starting CUDA worker '{{NAME}}'..."
-    WORKER_ONLY=1 GPU_TARGET=cuda MIX_BUILD_PATH=_build/cuda \
-      elixir --sname {{NAME}} --cookie devcookie \
-      -S mix run --no-halt 2>&1 | tee run_{{NAME}}.log
-
-# Start a CUDA worker in background
-start-cuda-bg NAME="cuda_worker":
-    #!/usr/bin/env bash
-    echo "Starting CUDA worker '{{NAME}}' (bg)..."
-    WORKER_ONLY=1 GPU_TARGET=cuda MIX_BUILD_PATH=_build/cuda \
-      elixir --sname {{NAME}} --cookie devcookie \
-      -S mix run --no-halt > run_{{NAME}}.log 2>&1 &
-    echo "Worker started, check run_{{NAME}}.log"
-
-# Compile the default (ROCm) build
+# Compile the default (ROCm) build and snapshot the XLA extension
 compile:
+    #!/usr/bin/env bash
     mix compile
+    just _snapshot-xla dev rocm
 
-# Compile a separate CUDA build (one-time, takes a while for XLA download)
+# Compile the CUDA build variant (one-time, downloads CUDA XLA archive)
 compile-cuda:
     #!/usr/bin/env bash
     echo "Compiling CUDA build (XLA_TARGET=cuda)..."
-    echo "This downloads the CUDA XLA archive on first run."
-    XLA_TARGET=cuda MIX_BUILD_PATH=_build/cuda mix compile
+    XLA_TARGET=cuda GPU_TARGET=cuda MIX_BUILD_PATH=_build/cuda mix compile
+    just _snapshot-xla cuda cuda
 
-# Open the app in a browser (starts the server if not running)
+# Snapshot the XLA extension for a build variant so it doesn't get
+# clobbered when the other variant compiles. Both _build/dev and
+# _build/cuda create a symlink priv/xla_extension → deps/exla/cache/
+# which is shared. This replaces the symlink with a real copy.
+_snapshot-xla BUILD TARGET:
+    #!/usr/bin/env bash
+    PRIV="_build/{{BUILD}}/lib/exla/priv"
+    XLA_DIR="$PRIV/xla_extension"
+    SNAPSHOT="_build/{{BUILD}}_xla_snapshot"
+
+    # If we already have a snapshot, restore it
+    if [ -d "$SNAPSHOT" ] && [ -L "$XLA_DIR/lib" -o ! -d "$XLA_DIR" ]; then
+        rm -rf "$XLA_DIR"
+        cp -a "$SNAPSHOT" "$XLA_DIR"
+        echo "[{{TARGET}}] Restored XLA extension from snapshot"
+        exit 0
+    fi
+
+    # If xla_extension exists and is/contains symlinks, snapshot a real copy
+    if [ -d "$XLA_DIR" ]; then
+        rm -rf "$SNAPSHOT"
+        cp -aL "$XLA_DIR" "$SNAPSHOT"  # -L dereferences symlinks
+        # Replace symlinked dir with real copy
+        rm -rf "$XLA_DIR"
+        cp -a "$SNAPSHOT" "$XLA_DIR"
+        echo "[{{TARGET}}] Snapshotted XLA extension"
+    fi
+
+# --- Utilities ---
+
+# Open the app in a browser
 open:
     #!/usr/bin/env bash
-    SNAME="$(basename "$(pwd)")"
     if ! scripts/dev_node.sh status > /dev/null 2>&1; then
-        echo "Node $SNAME not running, starting in background..."
-        export PORT="${PORT:-$(phx-port)}"
-        export GPU_TARGET="${GPU_TARGET:-rocm}"
-        elixir --sname "$SNAME" --cookie devcookie -S mix phx.server > run.log 2>&1 &
-        scripts/dev_node.sh await
+        echo "Node not running, starting..."
+        just start
     fi
     phx-port open
-
-# Stop the running BEAM node gracefully
-stop:
-    scripts/dev_node.sh rpc "System.halt()"
 
 # Check if the BEAM node is running
 status:

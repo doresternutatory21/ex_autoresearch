@@ -48,6 +48,9 @@ defmodule ExAutoresearch.Cluster.LocalWorker do
 
     mix_env = if function_exported?(Mix, :env, 0), do: Atom.to_string(Mix.env()), else: "dev"
 
+    # Ensure the XLA extension is a real copy, not a symlink to shared cache
+    restore_xla_snapshot(project_dir, build_path)
+
     # Hermetic CUDA 12.8 runtime libraries (extracted from Docker build cache).
     # Required because system CUDA 13 compat symlinks don't satisfy versioned symbols.
     cuda_libs_dir = Path.join(project_dir, "_build/cuda_libs")
@@ -161,4 +164,42 @@ defmodule ExAutoresearch.Cluster.LocalWorker do
   defp xla_target("cuda"), do: "cuda12"
   defp xla_target("rocm"), do: "rocm"
   defp xla_target(_), do: "host"
+
+  # Restore the XLA extension from snapshot if the priv dir contains a
+  # symlink (which would point to the shared deps/exla/cache/ and may
+  # have been overwritten by a different build variant).
+  defp restore_xla_snapshot(project_dir, build_path) do
+    build_name = build_path |> String.replace("_build/", "")
+    xla_dir = Path.join([project_dir, build_path, "lib/exla/priv/xla_extension"])
+    snapshot = Path.join(project_dir, "_build/#{build_name}_xla_snapshot")
+    lib_link = Path.join(xla_dir, "lib")
+
+    cond do
+      File.dir?(snapshot) and (not File.dir?(xla_dir) or symlink?(lib_link)) ->
+        File.rm_rf!(xla_dir)
+        File.cp_r!(snapshot, xla_dir)
+        Logger.info("Restored XLA extension from snapshot for #{build_name}")
+
+      File.dir?(xla_dir) and symlink?(lib_link) ->
+        # No snapshot yet — create one by dereferencing the symlinks
+        File.rm_rf!(snapshot)
+        # Copy with dereferencing: read through symlinks
+        {_, 0} = System.cmd("cp", ["-aL", xla_dir, snapshot])
+        File.rm_rf!(xla_dir)
+        File.cp_r!(snapshot, xla_dir)
+        Logger.info("Created XLA snapshot for #{build_name}")
+
+      true ->
+        :ok
+    end
+  rescue
+    e -> Logger.warning("XLA snapshot restore failed: #{Exception.message(e)}")
+  end
+
+  defp symlink?(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :symlink}} -> true
+      _ -> false
+    end
+  end
 end
