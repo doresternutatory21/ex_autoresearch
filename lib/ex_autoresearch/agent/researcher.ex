@@ -5,6 +5,12 @@ defmodule ExAutoresearch.Agent.Researcher do
   All state lives in SQLite via Ash. Stops and resumes are seamless —
   the agent picks up where it left off by loading experiment history.
   Model can be switched mid-flight via set_model/1.
+
+  When multiple GPU nodes are available (e.g. ROCm + CUDA), spawns one
+  independent loop per node. Each loop proposes its own experiment via
+  the LLM, trains on its assigned GPU, and writes results to the shared
+  SQLite database. When either loop finds a new best, the other picks
+  it up on its next iteration automatically.
   """
 
   use GenServer
@@ -212,43 +218,77 @@ defmodule ExAutoresearch.Agent.Researcher do
   # --- Experiment loop ---
 
   defp experiment_loop(run) do
-    # Run baseline if no experiments yet
+    # Run baseline if no experiments yet (always on local node)
     if Registry.count_trials(run.id) == 0 do
       Logger.info("[#{run.tag}] Running baseline...")
       run_baseline(run)
     end
 
-    loop(run)
+    # Detect available GPU nodes: local + any connected workers
+    nodes = gpu_nodes()
+    Logger.info("[#{run.tag}] Starting #{length(nodes)} parallel GPU loop(s): #{inspect(Enum.map(nodes, &elem(&1, 0)))}")
+
+    # Spawn one independent loop per GPU node
+    tasks =
+      nodes
+      |> Enum.map(fn {label, target_node} ->
+        Task.async(fn -> gpu_loop(run, label, target_node) end)
+      end)
+
+    # Wait for all loops to finish (they run until campaign is paused/stopped)
+    Task.await_many(tasks, :infinity)
   end
 
-  @max_consecutive_errors 5
+  # Returns [{label, node_atom}] for each available GPU.
+  # Local node is always included. Connected worker nodes are added.
+  defp gpu_nodes do
+    local_target = System.get_env("GPU_TARGET", "rocm")
+    local = {"local/#{local_target}", node()}
 
-  defp loop(run, consecutive_errors \\ 0) do
-    # Re-read run from DB to get latest status/model (may have been changed mid-flight)
+    workers =
+      Node.list()
+      |> Enum.filter(fn n ->
+        name = Atom.to_string(n)
+        String.contains?(name, "worker") or String.contains?(name, "cuda")
+      end)
+      |> Enum.map(fn n ->
+        # Try to detect the GPU target on the remote node
+        gpu = try do
+          :rpc.call(n, System, :get_env, ["GPU_TARGET"], 5_000)
+        catch
+          _, _ -> "unknown"
+        end
+        gpu = gpu || "unknown"
+        {"#{Atom.to_string(n)}/#{gpu}", n}
+      end)
+
+    [local | workers]
+  end
+
+  # Independent loop for one GPU node. Runs until campaign is paused/stopped.
+  defp gpu_loop(run, label, target_node, consecutive_errors \\ 0) do
     run = Ash.get!(ExAutoresearch.Research.Campaign, run.id)
 
     if run.status == :running do
-      case propose_and_run(run) do
+      case propose_and_run(run, label, target_node) do
         :ok ->
-          loop(run, 0)
+          gpu_loop(run, label, target_node, 0)
 
         {:error, reason} ->
           errors = consecutive_errors + 1
-          Logger.error("Experiment failed (#{errors}/#{@max_consecutive_errors}): #{inspect(reason, limit: 3)}")
+          Logger.error("[#{label}] Failed (#{errors}/#{@max_consecutive_errors}): #{inspect(reason, limit: 3)}")
           broadcast(:experiment_error, %{error: inspect(reason, limit: 3), attempt: errors, max: @max_consecutive_errors})
 
           if errors >= @max_consecutive_errors do
-            Logger.error("[#{run.tag}] Too many consecutive errors, pausing campaign")
-            Registry.pause_campaign(run)
-            broadcast(:status_changed, %{status: :paused})
+            Logger.error("[#{label}] Too many consecutive errors, stopping this GPU loop")
           else
             backoff = min(3_000 * errors, 15_000)
             Process.sleep(backoff)
-            loop(run, errors)
+            gpu_loop(run, label, target_node, errors)
           end
       end
     else
-      Logger.info("[#{run.tag}] Research loop stopped")
+      Logger.info("[#{label}] GPU loop stopped")
     end
   end
 
@@ -308,7 +348,7 @@ defmodule ExAutoresearch.Agent.Researcher do
     end
   end
 
-  defp propose_and_run(run) do
+  defp propose_and_run(run, label, target_node) do
     version_id = gen_id()
     all_exps = Registry.all_trials(run.id)
     best = Registry.best_trial(run.id)
@@ -318,7 +358,7 @@ defmodule ExAutoresearch.Agent.Researcher do
     # Build prompt with full context
     prompt = Prompts.build_proposal_prompt(all_exps, best, kept, version_id)
 
-    Logger.info("[#{run.tag}] Asking #{run.model} for experiment v_#{version_id}...")
+    Logger.info("[#{label}] Asking #{run.model} for experiment v_#{version_id}...")
     broadcast(:agent_thinking, %{version_id: version_id})
 
     case LLM.prompt(prompt, system: Prompts.system_prompt(), model: run.model) do
@@ -344,9 +384,9 @@ defmodule ExAutoresearch.Agent.Researcher do
                 status: :running
               })
 
-            broadcast(:trial_started, %{version_id: version_id, description: description})
+            broadcast(:trial_started, %{version_id: version_id, description: description, gpu: label})
 
-            result = Runner.run(module, version_id: version_id, time_budget: effective_budget)
+            result = run_on_node(target_node, module, code, version_id, effective_budget)
 
             loss = sanitize_loss(result[:loss])
             kept = decide_keep(loss, best && best.final_loss)
@@ -368,14 +408,15 @@ defmodule ExAutoresearch.Agent.Researcher do
               Map.merge(result, %{
                 description: description,
                 kept: kept,
-                model: run.model
+                model: run.model,
+                gpu: label
               })
             )
 
             :ok
 
           {:error, reason} ->
-            Logger.error("Module v_#{version_id} failed to load: #{inspect(reason)}")
+            Logger.error("[#{label}] Module v_#{version_id} failed to load: #{inspect(reason)}")
 
             Registry.record_trial(%{
               campaign_id: run.id,
@@ -397,6 +438,7 @@ defmodule ExAutoresearch.Agent.Researcher do
               loss: nil,
               steps: 0,
               model: run.model,
+              gpu: label,
               error: inspect(reason)
             })
 
@@ -405,6 +447,35 @@ defmodule ExAutoresearch.Agent.Researcher do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # Execute training on the target node. Local node runs directly,
+  # remote nodes get the code shipped via :rpc.call and compile+train there.
+  defp run_on_node(target_node, module, _code, version_id, time_budget) when target_node == node() do
+    Runner.run(module, version_id: version_id, time_budget: time_budget)
+  end
+
+  defp run_on_node(target_node, _module, code, version_id, time_budget) do
+    Logger.info("[#{version_id}] Dispatching to remote node #{target_node}")
+
+    # Ship source code to the remote node: compile + train there
+    case :rpc.call(target_node, Code, :compile_string, [code], 30_000) do
+      modules when is_list(modules) ->
+        {remote_module, _bytecode} = List.last(modules)
+
+        case :rpc.call(target_node, Runner, :run, [remote_module, [version_id: version_id, time_budget: time_budget]], :infinity) do
+          {:badrpc, reason} ->
+            Logger.error("[#{version_id}] Remote training failed: #{inspect(reason, limit: 3)}")
+            %{version_id: version_id, status: :crashed, loss: nil, steps: 0, training_seconds: 0, error: inspect(reason), loss_history: []}
+
+          result when is_map(result) ->
+            result
+        end
+
+      {:badrpc, reason} ->
+        Logger.error("[#{version_id}] Remote compile failed: #{inspect(reason, limit: 3)}")
+        %{version_id: version_id, status: :crashed, loss: nil, steps: 0, training_seconds: 0, error: inspect(reason), loss_history: []}
     end
   end
 
