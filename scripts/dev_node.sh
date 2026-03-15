@@ -9,22 +9,20 @@ COOKIE="${DEV_NODE_COOKIE:-devcookie}"
 HOSTNAME="$(hostname -s)"
 FQDN="${APP_NAME}@${HOSTNAME}"
 CUDA_FQDN="${CUDA_NAME}@${HOSTNAME}"
-PIDFILE=".dev_node.pid"
 
 case "${1:-help}" in
   start)
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-      echo "Node already running (pid $(cat "$PIDFILE"))"
+    if epmd -names 2>/dev/null | grep -q "name ${APP_NAME} "; then
+      echo "Node ${FQDN} is already running"
       exit 0
     fi
     echo "Starting node ${FQDN} ..."
     elixir --sname "$APP_NAME" --cookie "$COOKIE" -S mix run --no-halt > .dev_node.log 2>&1 &
-    echo $! > "$PIDFILE"
     for i in $(seq 1 30); do
       if elixir --sname "probe_$$" --cookie "$COOKIE" --hidden -e "
         if Node.connect(:\"${FQDN}\"), do: System.halt(0), else: System.halt(1)
       " 2>/dev/null; then
-        echo "Node ${FQDN} is up (pid $(cat "$PIDFILE"))"
+        echo "Node ${FQDN} is up"
         exit 0
       fi
       sleep 1
@@ -34,31 +32,27 @@ case "${1:-help}" in
     ;;
 
   stop)
-    # Stop main node
-    if [ -f "$PIDFILE" ]; then
-      kill "$(cat "$PIDFILE")" 2>/dev/null && echo "Main node stopped" || echo "Main node was not running"
-      rm -f "$PIDFILE"
-    else
-      echo "No pidfile found for main node"
-    fi
-    # Stop CUDA worker if running
-    if epmd -names 2>/dev/null | grep -q "name ${CUDA_NAME} "; then
-      echo "Stopping CUDA worker ${CUDA_FQDN}..."
-      elixir --sname "stop_$$" --cookie "$COOKIE" --hidden -e "
-        target = :\"${CUDA_FQDN}\"
-        case Node.connect(target) do
-          true -> :rpc.call(target, System, :halt, [0])
-          _ -> :ok
-        end
-        System.halt(0)
-      " 2>/dev/null || true
-      # Wait for it to deregister
-      for i in $(seq 1 5); do
-        epmd -names 2>/dev/null | grep -q "name ${CUDA_NAME} " || break
-        sleep 1
-      done
-      echo "CUDA worker stopped"
-    fi
+    # Stop CUDA worker first (if running), then main node — all via RPC
+    for NODE_FQDN in "$CUDA_FQDN" "$FQDN"; do
+      NODE_SNAME="${NODE_FQDN%%@*}"
+      if epmd -names 2>/dev/null | grep -q "name ${NODE_SNAME} "; then
+        echo "Stopping ${NODE_FQDN}..."
+        elixir --sname "stop_$$" --cookie "$COOKIE" --hidden -e "
+          target = :\"${NODE_FQDN}\"
+          case Node.connect(target) do
+            true -> :rpc.call(target, System, :halt, [0])
+            _ -> :ok
+          end
+          System.halt(0)
+        " 2>/dev/null || true
+        # Wait for deregistration
+        for i in $(seq 1 5); do
+          epmd -names 2>/dev/null | grep -q "name ${NODE_SNAME} " || break
+          sleep 1
+        done
+      fi
+    done
+    echo "Stopped"
     ;;
 
   status)

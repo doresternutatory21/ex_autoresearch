@@ -13,9 +13,8 @@ start:
 
     echo "Starting $SNAME on GPU_TARGET=$GPU_TARGET, port $PORT"
     elixir --sname "$SNAME" --cookie devcookie -S mix phx.server > run.log 2>&1 &
-    echo $! > .dev_node.pid
     scripts/dev_node.sh await
-    echo "Main node $SNAME is up (pid $(cat .dev_node.pid))"
+    echo "Main node $SNAME is up"
 
 # Stop the full application (main node + CUDA worker)
 stop:
