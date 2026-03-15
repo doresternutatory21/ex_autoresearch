@@ -54,6 +54,7 @@ defmodule ExAutoresearch.Application do
   end
 
   # Auto-spawn CUDA worker if the CUDA build and hermetic libs exist.
+  # Worker sname is derived from main node: ex_autoresearch → ex_autoresearch_cuda
   defp cuda_worker_children do
     project_dir = File.cwd!()
     cuda_nif = Path.join(project_dir, "_build/cuda/lib/exla/priv/libexla.so")
@@ -61,9 +62,12 @@ defmodule ExAutoresearch.Application do
     has_nvidia? = System.find_executable("nvidia-smi") != nil
 
     if has_nvidia? and File.exists?(cuda_nif) and File.dir?(cuda_libs) do
+      main_sname = node() |> Atom.to_string() |> String.split("@") |> List.first()
+      worker_name = "#{main_sname}_cuda"
+
       [
         {ExAutoresearch.Cluster.LocalWorker,
-         name: "cuda_worker", gpu_target: "cuda", build_path: "_build/cuda"}
+         name: worker_name, gpu_target: "cuda", build_path: "_build/cuda"}
       ]
     else
       []

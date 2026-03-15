@@ -17,25 +17,9 @@ start:
     scripts/dev_node.sh await
     echo "Main node $SNAME is up (pid $(cat .dev_node.pid))"
 
-# Stop the full application (main node + any CUDA workers)
+# Stop the full application (main node + CUDA worker)
 stop:
-    #!/usr/bin/env bash
-    # Stop main node gracefully (this also terminates supervised CUDA workers)
-    if scripts/dev_node.sh status > /dev/null 2>&1; then
-        scripts/dev_node.sh rpc "System.halt()" 2>/dev/null || true
-        # Wait for main node to actually stop
-        for i in $(seq 1 10); do
-            scripts/dev_node.sh status > /dev/null 2>&1 || break
-            sleep 1
-        done
-    fi
-    # Clean up any orphaned CUDA workers (Port-spawned children may outlive parent)
-    for pid in $(ps aux | grep '[c]uda_worker.*mix' | awk '{print $2}'); do
-        echo "Cleaning up orphaned CUDA worker (pid $pid)"
-        kill -9 "$pid" 2>/dev/null || true
-    done
-    rm -f .dev_node.pid
-    echo "Stopped"
+    scripts/dev_node.sh stop
 
 # Start in foreground (visible output, for debugging)
 start-fg:

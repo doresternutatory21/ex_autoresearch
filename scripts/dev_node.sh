@@ -4,9 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 APP_NAME="${DEV_NODE_NAME:-$(basename "$PROJECT_DIR")}"
+CUDA_NAME="${APP_NAME}_cuda"
 COOKIE="${DEV_NODE_COOKIE:-devcookie}"
 HOSTNAME="$(hostname -s)"
 FQDN="${APP_NAME}@${HOSTNAME}"
+CUDA_FQDN="${CUDA_NAME}@${HOSTNAME}"
 PIDFILE=".dev_node.pid"
 
 case "${1:-help}" in
@@ -32,22 +34,45 @@ case "${1:-help}" in
     ;;
 
   stop)
+    # Stop main node
     if [ -f "$PIDFILE" ]; then
-      kill "$(cat "$PIDFILE")" 2>/dev/null && echo "Node stopped" || echo "Node was not running"
+      kill "$(cat "$PIDFILE")" 2>/dev/null && echo "Main node stopped" || echo "Main node was not running"
       rm -f "$PIDFILE"
     else
-      echo "No pidfile found"
+      echo "No pidfile found for main node"
+    fi
+    # Stop CUDA worker if running
+    if epmd -names 2>/dev/null | grep -q "name ${CUDA_NAME} "; then
+      echo "Stopping CUDA worker ${CUDA_FQDN}..."
+      elixir --sname "stop_$$" --cookie "$COOKIE" --hidden -e "
+        target = :\"${CUDA_FQDN}\"
+        case Node.connect(target) do
+          true -> :rpc.call(target, System, :halt, [0])
+          _ -> :ok
+        end
+        System.halt(0)
+      " 2>/dev/null || true
+      # Wait for it to deregister
+      for i in $(seq 1 5); do
+        epmd -names 2>/dev/null | grep -q "name ${CUDA_NAME} " || break
+        sleep 1
+      done
+      echo "CUDA worker stopped"
     fi
     ;;
 
   status)
+    rc=0
     if epmd -names 2>/dev/null | grep -q "name ${APP_NAME} "; then
       echo "Node ${FQDN} is running"
-      exit 0
     else
       echo "Node ${FQDN} is not running"
-      exit 1
+      rc=1
     fi
+    if epmd -names 2>/dev/null | grep -q "name ${CUDA_NAME} "; then
+      echo "Node ${CUDA_FQDN} is running"
+    fi
+    exit $rc
     ;;
 
   await)

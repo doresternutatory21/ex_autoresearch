@@ -274,6 +274,12 @@ defmodule ExAutoresearch.Agent.Researcher do
         :ok ->
           gpu_loop(run, label, target_node, 0)
 
+        {:error, {:not_ready, _}} ->
+          # LLM is busy with another loop's request — wait and retry
+          Logger.debug("[#{label}] LLM busy, retrying in 5s...")
+          Process.sleep(5_000)
+          gpu_loop(run, label, target_node, consecutive_errors)
+
         {:error, reason} ->
           errors = consecutive_errors + 1
           Logger.error("[#{label}] Failed (#{errors}/#{@max_consecutive_errors}): #{inspect(reason, limit: 3)}")
