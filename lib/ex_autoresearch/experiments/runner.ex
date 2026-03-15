@@ -304,16 +304,30 @@ defmodule ExAutoresearch.Experiments.Runner do
     e ->
       stacktrace = __STACKTRACE__ |> Exception.format_stacktrace() |> String.slice(0, 2000)
       error_detail = "#{Exception.message(e)}\n#{stacktrace}"
-      Logger.error("[#{version_id}] Training crashed: #{error_detail}")
+      steps = Process.get(:training_steps, 0)
+      elapsed = case Process.get(:training_start_time) do
+        nil -> 0.0
+        start -> (System.monotonic_time(:millisecond) - start) / 1000
+      end
+      loss = Process.get(:last_loss)
+      crash_phase = cond do
+        steps == 0 and String.contains?(stacktrace, "Axon.Loop") -> :jit_compile
+        steps == 0 -> :model_build
+        steps > 0 and loss == nil -> :early_training
+        steps > 0 -> :mid_training
+        true -> :unknown
+      end
+
+      Logger.error("[#{version_id}] Training crashed in #{crash_phase} phase (step #{steps}): #{error_detail}")
 
       %{
         version_id: version_id,
         status: :crashed,
-        loss: nil,
-        steps: 0,
-        training_seconds: 0,
-        error: error_detail,
-        loss_history: []
+        loss: loss,
+        steps: steps,
+        training_seconds: safe_round(elapsed, 1),
+        error: "[#{crash_phase}] #{error_detail}",
+        loss_history: Process.get(:loss_history, []) |> Enum.reverse() |> downsample(200)
       }
   end
 

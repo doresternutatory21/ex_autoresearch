@@ -35,19 +35,31 @@ defmodule ExAutoresearch.Agent.Prompts do
     else
       patterns = extract_patterns(crashed)
 
-      content = """
-      ## Known Pitfalls — DO NOT repeat these mistakes
+      # Separate infrastructure bugs from LLM code errors
+      {infra_bugs, llm_errors} = Enum.split_with(patterns, fn {pattern, _} ->
+        String.starts_with?(pattern, "INFRASTRUCTURE BUG")
+      end)
 
-      The following patterns have caused crashes in this campaign. Avoid them.
+      if infra_bugs != [] do
+        Logger.warning("Infrastructure bugs detected in #{length(infra_bugs)} pattern(s) — these are NOT LLM code issues")
+      end
 
-      #{Enum.map_join(patterns, "\n", fn {pattern, examples} ->
-        count = length(examples)
-        example = hd(examples)
-        "- **#{pattern}** (#{count} crash#{if count > 1, do: "es"}):\n  #{example}\n"
-      end)}
-      """
+      # Only put LLM errors in pitfalls.md (infra bugs shouldn't constrain the LLM)
+      if llm_errors != [] do
+        content = """
+        ## Known Pitfalls — DO NOT repeat these mistakes
 
-      File.write!(@pitfalls_path, content)
+        The following patterns have caused crashes in this campaign. Avoid them.
+
+        #{Enum.map_join(llm_errors, "\n", fn {pattern, examples} ->
+          count = length(examples)
+          example = hd(examples)
+          "- **#{pattern}** (#{count} crash#{if count > 1, do: "es"}):\n  #{example}\n"
+        end)}
+        """
+
+        File.write!(@pitfalls_path, content)
+      end
     end
   end
 
@@ -66,29 +78,49 @@ defmodule ExAutoresearch.Agent.Prompts do
 
   defp classify_error(error) do
     cond do
-      error =~ "Axon.embedding" and error =~ "computed" ->
-        "Axon.embedding on computed input (use Axon.nx with Nx.take instead)"
+      error =~ "[jit_compile]" or error =~ "[model_build]" ->
+        # These are LLM code errors — the model definition is wrong
+        cond do
+          error =~ "Axon.embedding" and error =~ "computed" ->
+            "Axon.embedding on computed input (use Axon.nx with Nx.take instead)"
 
-      error =~ "Axon.nx" and error =~ "compiling layer" ->
-        "Invalid operation inside Axon.nx callback (shape/type error at JIT time)"
+          error =~ "Axon.nx" and error =~ "compiling layer" ->
+            "Invalid operation inside Axon.nx callback (shape/type error at JIT time)"
 
-      error =~ "shape" or error =~ "Shape" ->
-        "Tensor shape mismatch"
+          error =~ "shape" or error =~ "Shape" ->
+            "Tensor shape mismatch in model definition"
+
+          error =~ "CompileError" or error =~ "undefined function" ->
+            "Compilation error (undefined function or bad syntax)"
+
+          error =~ "FunctionClauseError" ->
+            "FunctionClauseError (wrong argument types to Nx/Axon function)"
+
+          true ->
+            "Model build/JIT error"
+        end
+
+      error =~ "[mid_training]" ->
+        # These crash during training — might be LLM code OR infra
+        cond do
+          error =~ "ArithmeticError" or error =~ "NaN" or error =~ "nan" ->
+            "Numerical instability during training (NaN/Inf — try lower learning rate)"
+
+          error =~ "out of memory" or error =~ "OOM" ->
+            "Out of GPU memory (reduce batch_size or model dimensions)"
+
+          error =~ "serialize" or error =~ "erlang.++" ->
+            "INFRASTRUCTURE BUG: Serialization crash (not an LLM code issue)"
+
+          true ->
+            "Training crash (check error details)"
+        end
 
       error =~ "ArgumentError" or error =~ "argument error" ->
-        "ArgumentError (likely invalid Nx/Axon operation)"
+        "ArgumentError (likely invalid Nx/Axon operation or shape mismatch)"
 
-      error =~ "CompileError" or error =~ "undefined function" ->
-        "Compilation error (undefined function or bad syntax)"
-
-      error =~ "ArithmeticError" or error =~ "NaN" or error =~ "nan" ->
-        "Numerical instability (NaN/Inf — check learning rate and loss function)"
-
-      error =~ "out of memory" or error =~ "OOM" ->
-        "Out of GPU memory (reduce batch_size or model dimensions)"
-
-      error =~ "FunctionClauseError" ->
-        "FunctionClauseError (wrong argument types to Nx/Axon function)"
+      error =~ "serialize" or error =~ "erlang.++" ->
+        "INFRASTRUCTURE BUG: Serialization issue (not an LLM code issue)"
 
       true ->
         "Other crash"
