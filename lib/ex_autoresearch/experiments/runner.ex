@@ -159,6 +159,7 @@ defmodule ExAutoresearch.Experiments.Runner do
     Process.delete(:training_steps)
     Process.delete(:last_loss)
     Process.delete(:loss_history)
+    Process.delete(:final_loop_state)
 
     time_budget_ms = time_budget * 1000
 
@@ -235,12 +236,17 @@ defmodule ExAutoresearch.Experiments.Runner do
       |> Axon.Loop.handle_event(:iteration_completed, progress_handler)
       |> Axon.Loop.handle_event(:iteration_completed, halt_handler)
 
-    # Only capture full state when we might need checkpoints for migration
-    {loop, capture_state?} =
+    # Capture full loop state on the last iteration for checkpoint/migration.
+    # We can't use output_transform (it's used by metrics), so we stash it
+    # in the process dictionary from the halt_handler's final call.
+    loop =
       if step_budget do
-        {Map.put(loop, :output_transform, fn state -> state end), true}
+        Axon.Loop.handle_event(loop, :epoch_halted, fn state ->
+          Process.put(:final_loop_state, state)
+          {:continue, state}
+        end)
       else
-        {loop, false}
+        loop
       end
 
     # Attach previous state for resume
@@ -250,7 +256,7 @@ defmodule ExAutoresearch.Experiments.Runner do
 
     Logger.info("[#{version_id}] Starting training (JIT warmup, then #{budget_label})")
 
-    final_state = Axon.Loop.run(loop, data, %{}, epochs: 1, iterations: remaining)
+    _final = Axon.Loop.run(loop, data, %{}, epochs: 1, iterations: remaining)
 
     training_start = Process.get(:training_start_time) || System.monotonic_time(:millisecond)
     elapsed_s = (System.monotonic_time(:millisecond) - training_start) / 1000
@@ -263,15 +269,22 @@ defmodule ExAutoresearch.Experiments.Runner do
     status = if was_halted, do: :halted, else: :completed
 
     # Serialize checkpoint for GPU migration when halted early
-    if was_halted and capture_state? and is_struct(final_state, Axon.Loop.State) do
-      try do
-        checkpoint = Axon.Loop.serialize_state(final_state, [:compressed])
-        :ets.insert(@checkpoint_table, {version_id, checkpoint})
-        Logger.info("[#{version_id}] Checkpoint saved (#{div(byte_size(checkpoint), 1024)} KB)")
-      rescue
-        e ->
-          Logger.warning("[#{version_id}] Checkpoint serialization failed: #{Exception.message(e)}")
+    if was_halted and step_budget do
+      case Process.get(:final_loop_state) do
+        %Axon.Loop.State{} = loop_state ->
+          try do
+            checkpoint = Axon.Loop.serialize_state(loop_state)
+            :ets.insert(@checkpoint_table, {version_id, checkpoint})
+            Logger.info("[#{version_id}] Checkpoint saved (#{div(byte_size(checkpoint), 1024)} KB)")
+          rescue
+            e ->
+              Logger.warning("[#{version_id}] Checkpoint serialization failed: #{Exception.message(e)}")
+          end
+
+        _ ->
+          Logger.warning("[#{version_id}] No loop state captured for checkpoint")
       end
+      Process.delete(:final_loop_state)
     end
 
     Logger.info(
