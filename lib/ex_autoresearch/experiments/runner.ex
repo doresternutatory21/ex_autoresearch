@@ -234,7 +234,14 @@ defmodule ExAutoresearch.Experiments.Runner do
       Axon.Loop.trainer(model, loss_fn, optimizer, log: 0)
       |> Axon.Loop.handle_event(:iteration_completed, progress_handler)
       |> Axon.Loop.handle_event(:iteration_completed, halt_handler)
-      |> Map.put(:output_transform, fn state -> state end)
+
+    # Only capture full state when we might need checkpoints for migration
+    {loop, capture_state?} =
+      if step_budget do
+        {Map.put(loop, :output_transform, fn state -> state end), true}
+      else
+        {loop, false}
+      end
 
     # Attach previous state for resume
     loop = if prev_state, do: Axon.Loop.from_state(loop, prev_state), else: loop
@@ -256,10 +263,15 @@ defmodule ExAutoresearch.Experiments.Runner do
     status = if was_halted, do: :halted, else: :completed
 
     # Serialize checkpoint for GPU migration when halted early
-    if was_halted and is_struct(final_state, Axon.Loop.State) do
-      checkpoint = Axon.Loop.serialize_state(final_state, [:compressed])
-      :ets.insert(@checkpoint_table, {version_id, checkpoint})
-      Logger.info("[#{version_id}] Checkpoint saved (#{div(byte_size(checkpoint), 1024)} KB)")
+    if was_halted and capture_state? and is_struct(final_state, Axon.Loop.State) do
+      try do
+        checkpoint = Axon.Loop.serialize_state(final_state, [:compressed])
+        :ets.insert(@checkpoint_table, {version_id, checkpoint})
+        Logger.info("[#{version_id}] Checkpoint saved (#{div(byte_size(checkpoint), 1024)} KB)")
+      rescue
+        e ->
+          Logger.warning("[#{version_id}] Checkpoint serialization failed: #{Exception.message(e)}")
+      end
     end
 
     Logger.info(
