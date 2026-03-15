@@ -31,27 +31,18 @@ defmodule ExAutoresearch.Agent.Prompts do
       |> Enum.filter(&(&1.status == :crashed and &1.error != nil and &1.error != ""))
 
     if crashed == [] do
+      File.rm(@pitfalls_path)
       :ok
     else
       patterns = extract_patterns(crashed)
 
-      # Separate infrastructure bugs from LLM code errors
-      {infra_bugs, llm_errors} = Enum.split_with(patterns, fn {pattern, _} ->
-        String.starts_with?(pattern, "INFRASTRUCTURE BUG")
-      end)
-
-      if infra_bugs != [] do
-        Logger.warning("Infrastructure bugs detected in #{length(infra_bugs)} pattern(s) — these are NOT LLM code issues")
-      end
-
-      # Only put LLM errors in pitfalls.md (infra bugs shouldn't constrain the LLM)
-      if llm_errors != [] do
+      if patterns != [] do
         content = """
         ## Known Pitfalls — DO NOT repeat these mistakes
 
         The following patterns have caused crashes in this campaign. Avoid them.
 
-        #{Enum.map_join(llm_errors, "\n", fn {pattern, examples} ->
+        #{Enum.map_join(patterns, "\n", fn {pattern, examples} ->
           count = length(examples)
           example = hd(examples)
           "- **#{pattern}** (#{count} crash#{if count > 1, do: "es"}):\n  #{example}\n"
@@ -59,6 +50,8 @@ defmodule ExAutoresearch.Agent.Prompts do
         """
 
         File.write!(@pitfalls_path, content)
+      else
+        File.rm(@pitfalls_path)
       end
     end
   end
@@ -68,10 +61,19 @@ defmodule ExAutoresearch.Agent.Prompts do
     |> Enum.map(fn t ->
       error = t.error || ""
       pattern = classify_error(error)
-      example = String.slice(error, 0, 200) |> String.replace("\n", " ")
+      # Use the first meaningful line as the example, skip binary gibberish
+      example =
+        error
+        |> String.split("\n", trim: true)
+        |> Enum.reject(&(&1 =~ ~r/^[\s]*<<\d/ or &1 =~ ~r/:erlang\.\+\+/))
+        |> Enum.take(2)
+        |> Enum.join(" | ")
+        |> String.slice(0, 200)
       {pattern, example}
     end)
+    |> Enum.reject(fn {_, example} -> example == "" or example =~ "Stale running" end)
     |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Enum.reject(fn {pattern, _} -> String.starts_with?(pattern, "INFRASTRUCTURE BUG") end)
     |> Enum.sort_by(fn {_, examples} -> -length(examples) end)
     |> Enum.take(10)
   end
