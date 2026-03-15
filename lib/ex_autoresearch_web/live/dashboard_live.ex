@@ -49,7 +49,6 @@ defmodule ExAutoresearchWeb.DashboardLive do
       |> assign(:new_campaign_tag, default_tag())
       |> assign(:time_budget, 300)
       |> assign(:step_budget, nil)
-      |> assign(:step_budget, nil)
       |> assign(:current_step, nil)
       |> assign(:current_progress, nil)
       |> assign(:live_curves, %{})
@@ -110,6 +109,7 @@ defmodule ExAutoresearchWeb.DashboardLive do
      |> assign(:best_version, nil)
      |> assign(:trial_count, 0)
      |> assign(:time_budget, 300)
+     |> assign(:step_budget, nil)
      |> assign(:selected, nil)
      |> assign(:chart_trials, [])
      |> stream(:trials, [], reset: true)
@@ -150,28 +150,23 @@ defmodule ExAutoresearchWeb.DashboardLive do
   end
 
   @impl true
-  def handle_event("change_time_budget", params, socket) do
-    case params do
-      %{"time_budget" => val} ->
-        case Integer.parse(val) do
-          {seconds, _} when seconds > 0 ->
-            socket = assign(socket, :time_budget, seconds)
+  def handle_event("change_budget", %{"budget" => "t:" <> val}, socket) do
+    case Integer.parse(val) do
+      {seconds, _} when seconds > 0 ->
+        socket = socket |> assign(:time_budget, seconds) |> assign(:step_budget, nil)
+        {:noreply, add_log(socket, "⏱ Budget → #{fmt_duration(seconds)}")}
 
-            if socket.assigns.selected_campaign_id do
-              case Registry.get_campaign_by_id(socket.assigns.selected_campaign_id) do
-                {:ok, run} when not is_nil(run) ->
-                  Registry.update_campaign_time_budget(run, seconds)
+      _ ->
+        {:noreply, socket}
+    end
+  end
 
-                _ ->
-                  :ok
-              end
-            end
-
-            {:noreply, add_log(socket, "⏱ Time budget → #{seconds}s")}
-
-          _ ->
-            {:noreply, socket}
-        end
+  def handle_event("change_budget", %{"budget" => "s:" <> val}, socket) do
+    case Integer.parse(val) do
+      {steps, _} when steps > 0 ->
+        label = if steps >= 1000, do: "#{div(steps, 1000)}k", else: "#{steps}"
+        socket = socket |> assign(:step_budget, steps) |> assign(:time_budget, 86_400)
+        {:noreply, add_log(socket, "📏 Budget → #{label} steps")}
 
       _ ->
         {:noreply, socket}
@@ -182,22 +177,6 @@ defmodule ExAutoresearchWeb.DashboardLive do
   def handle_event("stop_research", _params, socket) do
     Researcher.stop_research()
     {:noreply, assign(socket, :agent_status, :stopping)}
-  end
-
-  @impl true
-  def handle_event("change_step_budget", %{"step_budget" => "time"}, socket) do
-    {:noreply, socket |> assign(:step_budget, nil) |> add_log("📏 Budget → time-based")}
-  end
-
-  def handle_event("change_step_budget", %{"step_budget" => val}, socket) do
-    case Integer.parse(val) do
-      {steps, _} when steps > 0 ->
-        label = if steps >= 1000, do: "#{div(steps, 1000)}k", else: "#{steps}"
-        {:noreply, socket |> assign(:step_budget, steps) |> add_log("📏 Step budget → #{label} steps")}
-
-      _ ->
-        {:noreply, socket}
-    end
   end
 
   @impl true
@@ -563,6 +542,14 @@ defmodule ExAutoresearchWeb.DashboardLive do
   defp fmt_duration(s) when is_number(s) and s < 60, do: "#{round(s)}s"
   defp fmt_duration(s) when is_number(s), do: "#{div(round(s), 60)}m#{rem(round(s), 60)}s"
 
+  defp budget_selected?("t:" <> val, time_budget, step_budget) do
+    step_budget == nil and "#{time_budget}" == val
+  end
+
+  defp budget_selected?("s:" <> val, _time_budget, step_budget) do
+    step_budget != nil and "#{step_budget}" == val
+  end
+
   defp short_gpu(nil), do: "-"
 
   defp short_gpu(label) when is_binary(label) do
@@ -655,20 +642,12 @@ defmodule ExAutoresearchWeb.DashboardLive do
                 />
               </form>
             <% end %>
-            <form phx-change="change_time_budget" class="flex items-center gap-1">
-              <select name="time_budget"
+            <form phx-change="change_budget" class="flex items-center gap-1">
+              <select name="budget"
                 class="bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-2 py-1.5 focus:ring-indigo-500 focus:border-indigo-500">
-                <%= for {secs, label} <- [{15, "15s"}, {60, "1m"}, {120, "2m"}, {300, "5m"}, {600, "10m"}, {900, "15m"}] do %>
-                  <option value={secs} selected={secs == @time_budget}><%= label %></option>
-                <% end %>
-              </select>
-            </form>
-            <form phx-change="change_step_budget" class="flex items-center gap-1">
-              <select name="step_budget"
-                class="bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-2 py-1.5 focus:ring-indigo-500 focus:border-indigo-500">
-                <option value="time" selected={@step_budget == nil}>⏱ Time</option>
-                <%= for {steps, label} <- [{50_000, "50k"}, {100_000, "100k"}, {150_000, "150k"}, {200_000, "200k"}, {300_000, "300k"}, {500_000, "500k"}] do %>
-                  <option value={steps} selected={steps == @step_budget}>📏 <%= label %></option>
+                <%= for {val, label} <- [{"t:15", "⏱ 15s"}, {"t:60", "⏱ 1m"}, {"t:120", "⏱ 2m"}, {"t:300", "⏱ 5m"}, {"t:600", "⏱ 10m"}, {"t:900", "⏱ 15m"},
+                                         {"s:50000", "📏 50k steps"}, {"s:100000", "📏 100k"}, {"s:150000", "📏 150k"}, {"s:200000", "📏 200k"}, {"s:300000", "📏 300k"}, {"s:500000", "📏 500k"}] do %>
+                  <option value={val} selected={budget_selected?(val, @time_budget, @step_budget)}><%= label %></option>
                 <% end %>
               </select>
             </form>
