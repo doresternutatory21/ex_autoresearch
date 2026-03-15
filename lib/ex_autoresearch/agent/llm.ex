@@ -33,7 +33,7 @@ defmodule ExAutoresearch.Agent.LLM do
           status: :connecting | :idle | :error
         }
 
-  defstruct [:active, backends: %{}]
+  defstruct [:active, :inflight, backends: %{}, queue: :queue.new()]
 
   # --- Client API ---
 
@@ -112,17 +112,14 @@ defmodule ExAutoresearch.Agent.LLM do
     {backend, default_model} = state.active
     model = model_override || default_model
 
-    # Ensure this backend+model is started
     state = ensure_backend_started(state, backend, model)
 
     case get_backend_pid(state, backend) do
       {:ok, pid} ->
-        # Delegate to the backend GenServer
-        Task.start(fn ->
-          result = GenServer.call(pid, {:prompt, text, model}, :timer.minutes(4))
-          GenServer.reply(from, result)
-        end)
-
+        # Queue the request; dispatch immediately if nothing else in-flight
+        queue = :queue.in({from, text, model, pid}, state.queue)
+        state = %{state | queue: queue}
+        state = dispatch_next(state)
         {:noreply, state}
 
       :error ->
@@ -181,9 +178,37 @@ defmodule ExAutoresearch.Agent.LLM do
   end
 
   @impl true
+  def handle_info(:prompt_complete, state) do
+    state = %{state | inflight: nil}
+    state = dispatch_next(state)
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_info(_, state), do: {:noreply, state}
 
   # --- Private ---
+
+  # Dispatch the next queued prompt if nothing is in-flight
+  defp dispatch_next(%{inflight: inflight} = state) when not is_nil(inflight), do: state
+
+  defp dispatch_next(state) do
+    case :queue.out(state.queue) do
+      {:empty, _} ->
+        state
+
+      {{:value, {from, text, model, pid}}, rest} ->
+        llm_pid = self()
+
+        Task.start(fn ->
+          result = GenServer.call(pid, {:prompt, text, model}, :timer.minutes(4))
+          GenServer.reply(from, result)
+          send(llm_pid, :prompt_complete)
+        end)
+
+        %{state | queue: rest, inflight: from}
+    end
+  end
 
   defp ensure_backend_started(state, backend, model) do
     case Map.get(state.backends, backend) do
