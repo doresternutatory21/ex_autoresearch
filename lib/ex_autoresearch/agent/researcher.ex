@@ -233,7 +233,8 @@ defmodule ExAutoresearch.Agent.Researcher do
   @max_consecutive_errors 5
 
   defp experiment_loop(run) do
-    nodes = gpu_nodes()
+    # Wait for GPU workers to finish booting (up to 60s)
+    nodes = await_gpu_nodes(10)
 
     # Run baseline if no experiments yet — prefer the fastest GPU (workers first)
     if Registry.count_trials(run.id) == 0 do
@@ -263,8 +264,30 @@ defmodule ExAutoresearch.Agent.Researcher do
     if referee, do: GenServer.stop(referee, :normal)
   end
 
+  # Wait for GPU worker nodes to become ready (EXLA loaded).
+  # Retries up to max_retries times with 5s intervals.
+  defp await_gpu_nodes(retries_left) do
+    nodes = gpu_nodes()
+    connected_workers = Node.list() |> Enum.filter(fn n ->
+      name = Atom.to_string(n)
+      String.contains?(name, "worker") or String.contains?(name, "cuda")
+    end)
+
+    ready_workers = length(nodes) - 1
+    total_workers = length(connected_workers)
+
+    if ready_workers < total_workers and retries_left > 0 do
+      Logger.info("Waiting for #{total_workers - ready_workers} GPU worker(s) to finish booting... (#{retries_left} retries left)")
+      Process.sleep(5_000)
+      await_gpu_nodes(retries_left - 1)
+    else
+      nodes
+    end
+  end
+
   # Returns [{label, node_atom}] for each available GPU.
-  # Local node is always included. Connected worker nodes are added.
+  # Local node is always included. Connected worker nodes are added
+  # only if they're fully booted (EXLA loaded and responsive).
   defp gpu_nodes do
     local_target = System.get_env("GPU_TARGET", "rocm")
     local = {"local/#{local_target}", node()}
@@ -275,8 +298,16 @@ defmodule ExAutoresearch.Agent.Researcher do
         name = Atom.to_string(n)
         String.contains?(name, "worker") or String.contains?(name, "cuda")
       end)
+      |> Enum.filter(fn n ->
+        # Verify the worker is fully booted by checking EXLA is available
+        case :rpc.call(n, Code, :ensure_loaded?, [EXLA.Backend], 5_000) do
+          true -> true
+          _ ->
+            Logger.info("Worker #{n} not ready yet, skipping")
+            false
+        end
+      end)
       |> Enum.map(fn n ->
-        # Try to detect the GPU target on the remote node
         gpu = try do
           :rpc.call(n, System, :get_env, ["GPU_TARGET"], 5_000)
         catch
