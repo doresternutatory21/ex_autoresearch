@@ -45,3 +45,4 @@ run.log
 .dev_node.pid
 
 priv/prompts/pitfalls.md
+winner.md

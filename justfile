@@ -88,6 +88,10 @@ open:
 status:
     #!/usr/bin/env bash
     scripts/dev_node.sh status
+
+# Print the best experiment across all campaigns → winner.md
+winner:
+    scripts/winner.sh
     echo "---"
     epmd -names 2>&1 | grep -v "^epmd:"
 
