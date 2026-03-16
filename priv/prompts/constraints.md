@@ -14,9 +14,8 @@
 
 ## API compatibility (Polaris 0.1.0 / Axon 0.8.1)
 
-- **DO NOT use Polaris.Schedules** (cosine_decay, exponential_decay, etc.) as learning rate — they crash with `Nx.LazyContainer not implemented for List` due to a Polaris/Nx incompatibility. Use a constant learning rate instead.
 - **DO NOT use Axon.param/4** — it is undefined/private in Axon 0.8.1.
 - **DO NOT pass Axon graph nodes to Axon.nx/3** — the first argument must be an Axon layer output, not a raw Axon struct or parameter.
 - **DO NOT use Axon.multiply/2 with non-layer arguments** — both arguments must be Axon layers.
 - **DO NOT use Axon.Layers.swish** — use `Axon.activation(:silu)` instead.
-- Use `Polaris.Optimizers.adamw(learning_rate: 0.01)` with a float, not a schedule function.
+- Learning rate schedules like `Polaris.Schedules.cosine_decay/2` are supported.
