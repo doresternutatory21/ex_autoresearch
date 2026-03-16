@@ -10,4 +10,13 @@
   - `loss_fn/2` — custom loss function (default: categorical_cross_entropy)
 - Available libraries: Axon, Nx, Nx.Defn, Polaris, EXLA
 - The model will be trained on next-token prediction with synthetic data
-- Training runs for a fixed time budget (default 15 seconds, excluding JIT warmup)
+- Training runs for a fixed step count or time budget
+
+## API compatibility (Polaris 0.1.0 / Axon 0.8.1)
+
+- **DO NOT use Polaris.Schedules** (cosine_decay, exponential_decay, etc.) as learning rate — they crash with `Nx.LazyContainer not implemented for List` due to a Polaris/Nx incompatibility. Use a constant learning rate instead.
+- **DO NOT use Axon.param/4** — it is undefined/private in Axon 0.8.1.
+- **DO NOT pass Axon graph nodes to Axon.nx/3** — the first argument must be an Axon layer output, not a raw Axon struct or parameter.
+- **DO NOT use Axon.multiply/2 with non-layer arguments** — both arguments must be Axon layers.
+- **DO NOT use Axon.Layers.swish** — use `Axon.activation(:silu)` instead.
+- Use `Polaris.Optimizers.adamw(learning_rate: 0.01)` with a float, not a schedule function.
